@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { Store, nowIso, newId, groupKeyOf } from "./lib/store.js";
 import { decode } from "./lib/png.js";
 import { analyzeImage, judge, hammingDistance } from "./lib/imaging.js";
-import { canonicalHash, legacyFingerprint, firstNonFinitePath } from "./lib/canonical.js";
+import { canonicalHash, legacyFingerprint, validateJsonValue } from "./lib/canonical.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dataDir = process.env.DATA_DIR || join(__dirname, "data");
@@ -508,13 +508,13 @@ function summarizeMetrics(m) {
 async function idempotent(req, input, scope, who, fn) {
   const key = String(req.headers["idempotency-key"] || "").trim();
 
-  // 先于指纹与任何写事务：拒绝非有限 JSON 数字。
-  // Node 的 JSON.parse 对超大指数（如 1e999）会得到 Infinity/-Infinity，
-  // 若继续走 TLV 指纹会抛内部异常。这里明确返回 400，且不写身份绑定、
-  // 不写幂等记录、不进入业务事务。
-  const badPath = firstNonFinitePath(input);
-  if (badPath !== null) {
-    throw httpError(400, "non_finite_number", { path: badPath });
+  // 先于指纹与任何写事务做迭代式校验（自身不随嵌套深度增长调用栈）：
+  //   - 嵌套超过 MAX_JSON_DEPTH → 400 json_depth_exceeded，避免递归指纹/校验栈溢出；
+  //   - 非有限 JSON 数字（如 1e999→Infinity）→ 400 non_finite_number。
+  // 两类拒绝都不写身份绑定、不写幂等记录、不进入业务事务。
+  const validation = validateJsonValue(input);
+  if (validation) {
+    throw httpError(400, validation.error, { path: validation.path });
   }
 
   await store.mutate(db => {

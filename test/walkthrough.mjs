@@ -10,7 +10,10 @@ import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
 
 import { sharpSet, blurryPng, blankSheet, garbagePng, fourthPng, fifthPng, lookalikePair, dataUrl } from "./fixtures.mjs";
-import { canonicalHash, legacyFingerprint, legacyCanonicalFingerprint, firstNonFinitePath } from "../lib/canonical.js";
+import {
+  canonicalHash, legacyFingerprint, legacyCanonicalFingerprint,
+  firstNonFinitePath, validateJsonValue, MAX_JSON_DEPTH,
+} from "../lib/canonical.js";
 import { createHash } from "node:crypto";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -415,12 +418,18 @@ async function main() {
   check("采集人「采集员甲」切复核人角色 → 403",
     jiaAsReviewer.status === 403 && jiaAsReviewer.json.error === "identity_role_bound");
 
-  section("3.4 非有限 JSON 数字：指纹前拒绝且不写库");
+  section("3.4 非有限数字与深嵌套：指纹前拒绝且不写库");
   check("单元：递归检出 Infinity/-Infinity/NaN 的路径",
     firstNonFinitePath({ a: { b: [1, { c: 1e999 }] } }) === "$.a.b[1].c"
     && firstNonFinitePath({ a: [1, -1e999] }) === "$.a[1]"
     && firstNonFinitePath({ a: NaN }) === "$.a" // NaN 无法经标准 JSON 体到达，仅纯函数防御
     && firstNonFinitePath({ ok: -0, tiny: 1e-999, big: 9007199254740993, max: 1e308 }) === null);
+  check("单元：迭代校验深度边界（上限 " + MAX_JSON_DEPTH + "）与深层非有限数",
+    validateJsonValue(JSON.parse("{\"a\":".repeat(MAX_JSON_DEPTH) + "1" + "}".repeat(MAX_JSON_DEPTH))) === null
+    && validateJsonValue(JSON.parse("{\"a\":".repeat(MAX_JSON_DEPTH + 1) + "1" + "}".repeat(MAX_JSON_DEPTH + 1)))?.error === "json_depth_exceeded"
+    && validateJsonValue(JSON.parse("[".repeat(MAX_JSON_DEPTH + 1) + "1" + "]".repeat(MAX_JSON_DEPTH + 1)))?.error === "json_depth_exceeded"
+    && validateJsonValue(JSON.parse("{\"a\":{\"b\":1e999}}"))?.error === "non_finite_number"
+    && validateJsonValue(JSON.parse("{\"a\":".repeat(10000) + "1e999" + "}".repeat(10000))) !== null); // 万级嵌套也不栈溢出
 
   const nonFiniteCases = [
     ["nonfinite-k1", "顶层指数溢出", '{"code":"IS-INF1","ageYears":1e999}'],
@@ -478,6 +487,56 @@ async function main() {
     check("边界数值被接受：" + code, r.status === 201 && Number.isFinite(r.json.ageYears),
       `${r.status} ${r.json.ageYears}`);
   }
+
+  // 深度边界：恰好上限可接受；超一层即 400（不是 500）；深层非有限数也 400
+  // 顶层保留 code（业务需要），另用 x 链把最深值推到深度 n
+  const nestedCode = n => '{"code":"IS-DEPTH-OK","x":'
+    + '{"x":'.repeat(Math.max(0, n - 1)) + "1" + "}".repeat(Math.max(0, n - 1)) + "}";
+  const deepOk = await api("/api/samples", {
+    method: "POST", role: "operator", name: "采集员丁", idem: "depth-ok",
+    raw: nestedCode(MAX_JSON_DEPTH),
+  });
+  check("恰达深度上限 " + MAX_JSON_DEPTH + " → 201", deepOk.status === 201, String(deepOk.status));
+  const deepBad = await api("/api/samples", {
+    method: "POST", role: "operator", name: "采集员丁", idem: "depth-bad",
+    raw: nestedCode(MAX_JSON_DEPTH + 1),
+  });
+  check("超过深度上限一层 → 400 json_depth_exceeded（不回 500）",
+    deepBad.status === 400 && deepBad.json.error === "json_depth_exceeded",
+    `${deepBad.status} ${JSON.stringify(deepBad.json.error)}`);
+  // 万级嵌套：旧递归会栈溢出，迭代校验必须仍稳定返回 400
+  const veryDeep = await api("/api/samples", {
+    method: "POST", role: "operator", name: "采集员丁", idem: "depth-huge",
+    raw: nestedCode(10000),
+  });
+  check("万级嵌套 → 400 且进程未崩溃", veryDeep.status === 400 && veryDeep.json.error === "json_depth_exceeded",
+    String(veryDeep.status));
+  // 深层非有限数（深度合法但数值越界）
+  const deepNonFinite = '{"z":'.repeat(10) + "1e999" + "}".repeat(10);
+  const dnf = await api("/api/samples", {
+    method: "POST", role: "operator", name: "采集员丁", idem: "depth-nonfinite",
+    raw: deepNonFinite,
+  });
+  check("深层非有限数字 → 400 non_finite_number",
+    dnf.status === 400 && dnf.json.error === "non_finite_number",
+    `${dnf.status} ${dnf.json.path}`);
+  // 深度失败不得毒化幂等键、不得写身份绑定（新名字先 review 发超深请求失败，再 operator 建档）
+  const deepKeyRetry = await api("/api/samples", {
+    method: "POST", role: "operator", name: "采集员丁", idem: "depth-bad",
+    body: { code: "IS-AFTER-DEEP" },
+  });
+  check("超深失败后同幂等键合法请求仍成功", deepKeyRetry.status === 201, String(deepKeyRetry.status));
+  const deepFreshBad = await api(`/api/samples/${sid}/review`, {
+    method: "POST", role: "reviewer", name: "深层数辛", idem: "depth-fresh",
+    raw: '{"z":'.repeat(100) + '{"decision":"approve"}' + "}".repeat(100),
+  });
+  const deepFreshGood = await api("/api/samples", {
+    method: "POST", role: "operator", name: "深层数辛", idem: "depth-fresh-ok",
+    body: { code: "IS-DEEP-FRESH-OK" },
+  });
+  check("超深失败不绑定身份（reviewer 失败后同名人可作 operator）",
+    deepFreshBad.status === 400 && deepFreshGood.status === 201,
+    JSON.stringify([deepFreshBad.status, deepFreshGood.status]));
 
   section("4. 三张有效图 → 自动分组出结论并锁定");
   const batch3 = await api(`/api/samples/${sid}/photos:batch`, {
@@ -914,6 +973,14 @@ async function main() {
     nonFiniteAfterRestart.status === 400
     && nonFiniteAfterRestart.json.error === "non_finite_number",
     String(nonFiniteAfterRestart.status));
+  const deepAfterRestart = await api(`/api/samples/${sidRL}/review`, {
+    method: "POST", role: "reviewer", name: "复核员壬", idem: "restart-depth",
+    raw: '{"z":'.repeat(100) + '{"decision":"approve"}' + "}".repeat(100),
+  });
+  check("重启后超深嵌套 → 400 json_depth_exceeded（不栈溢出、不回 500）",
+    deepAfterRestart.status === 400
+    && deepAfterRestart.json.error === "json_depth_exceeded",
+    String(deepAfterRestart.status));
 
   await stop(srv.child);
   console.log(`\n走查结果：${passed} 通过，${failed} 失败`);

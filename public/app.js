@@ -422,6 +422,8 @@ function friendly(err) {
     payload_too_large: "批次过大，请减少张数",
     identity_role_bound: "该姓名已绑定另一角色，请使用原角色或更换姓名",
     reviewer_is_collector: "采集人不能复核自己参与采集的版本",
+    non_finite_number: "提交内容含非法数值（超出有限范围）",
+    json_depth_exceeded: "提交内容嵌套层级过深",
   };
   return map[err.message] || err.message + (err.data?.hint ? `（${err.data.hint}）` : "");
 }
