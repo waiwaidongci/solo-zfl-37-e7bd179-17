@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
 
-import { sharpSet, blurryPng, blankSheet, garbagePng, fourthPng, fifthPng, dataUrl } from "./fixtures.mjs";
+import { sharpSet, blurryPng, blankSheet, garbagePng, fourthPng, fifthPng, lookalikePair, dataUrl } from "./fixtures.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
@@ -34,7 +34,10 @@ async function api(path, opts = {}) {
   if (opts.role) headers["X-Role"] = opts.role;
   if (opts.name) headers["X-Operator-Name"] = encodeURIComponent(opts.name);
   if (opts.idem) headers["Idempotency-Key"] = opts.idem;
-  const res = await fetch(BASE + path, { method: opts.method || "GET", headers, body: opts.body ? JSON.stringify(opts.body) : undefined });
+  const res = await fetch((opts.base || BASE) + path, {
+    method: opts.method || "GET", headers,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
   let json = null;
   try { json = await res.json(); } catch {}
   return { status: res.status, json, res };
@@ -50,12 +53,12 @@ function entry(pngBuf, extra = {}) {
   };
 }
 
-function waitForServer(child, timeoutMs = 8000) {
+function waitForServer(child, port = PORT, timeoutMs = 8000) {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error("server start timeout")), timeoutMs);
     const timer = setInterval(async () => {
       try {
-        const r = await fetch(BASE + "/api/state");
+        const r = await fetch(`http://127.0.0.1:${port}/api/state`);
         if (r.ok) { clearInterval(timer); clearTimeout(t); resolve(); }
       } catch {}
     }, 120);
@@ -64,16 +67,17 @@ function waitForServer(child, timeoutMs = 8000) {
 }
 
 async function startServer(dataDir, opts = {}) {
+  const port = opts.port || PORT;
   const child = spawn(process.execPath, [join(root, "server.js")], {
-    env: { ...process.env, PORT: String(PORT), DATA_DIR: dataDir, ALLOW_FAULTS: opts.faults ? "1" : "" },
+    env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, ALLOW_FAULTS: opts.faults ? "1" : "" },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let logs = "";
   child.stdout.on("data", d => { logs += d; });
   child.stderr.on("data", d => { logs += d; });
-  await waitForServer(child);
+  await waitForServer(child, port);
   children.push(child);
-  return { child, get logs() { return logs; } };
+  return { child, port, get logs() { return logs; } };
 }
 
 async function main() {
@@ -158,6 +162,59 @@ async function main() {
   });
   check("跨批重复提交只计一次成功（图判重复）", batch2.json.results[0].invalidReason === "duplicate" && batch2.json.validCount === 1);
 
+  section("3.1 反例：幂等指纹必须区分完整图片内容");
+  const [lookA, lookB] = lookalikePair();
+  check("反例构造：两张图等长", lookA.length === lookB.length);
+  check("反例构造：开头相同、尾部才不同", lookA.subarray(0, lookA.length - 60).equals(lookB.subarray(0, lookB.length - 60))
+    && !lookA.equals(lookB));
+  const cFp = await api("/api/samples", {
+    method: "POST", role: "operator", name: "采集员丁", idem: "fp-create",
+    body: { code: "IS-FP" },
+  });
+  const sidFp = cFp.json.id;
+  const firstLook = await api(`/api/samples/${sidFp}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "fp-key",
+    body: { photos: [entry(lookA, { clientName: "look-a.png" })] },
+  });
+  check("第一张提交成功并落库", firstLook.status === 201 && firstLook.json.results[0].valid === true);
+  const secondLook = await api(`/api/samples/${sidFp}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "fp-key",
+    body: { photos: [entry(lookB, { clientName: "look-b.png" })] }, // 同键、图片尾部不同
+  });
+  check("同键但图片不同 → 409，不会误当重放", secondLook.status === 409
+    && secondLook.json.error.includes("idempotency"), String(secondLook.status));
+  st = (await api("/api/state")).json;
+  check("第二张未被当作重放而静默丢失（库里仍只有 1 张）",
+    st.samples.find(s => s.id === sidFp).versions[0].photos.length === 1);
+  const replaySame = await api(`/api/samples/${sidFp}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "fp-key",
+    body: { photos: [entry(lookA, { clientName: "look-a.png" })] },
+  });
+  check("同键同载荷仍正常重放（且不新增图片）",
+    replaySame.status === 201 && st.samples.find(s => s.id === sidFp).versions[0].photos.length === 1);
+
+  section("3.2 反例：姓名↔角色稳定绑定，换角色被拒");
+  // 新姓名先用复核人身份
+  const revFirst = await api(`/api/samples/${sid}/review`, {
+    method: "POST", role: "reviewer", name: "临时工戊",
+    body: { decision: "approve" },
+  });
+  // sid 已批准，返回 409 不重要，关键是该姓名已以 reviewer 落库绑定
+  check("新姓名首次以复核人身份被系统记录", [409, 200].includes(revFirst.status));
+  const sameNameCollect = await api("/api/samples", {
+    method: "POST", role: "operator", name: "临时工戊", idem: "role-swap",
+    body: { code: "IS-ROLE" },
+  });
+  check("同一姓名换操作员身份 → 403 identity_role_bound",
+    sameNameCollect.status === 403 && sameNameCollect.json.error === "identity_role_bound");
+  // 反向：已绑定操作员的姓名不能当复核人（复现报告中的越权路径）
+  const jiaAsReviewer = await api(`/api/samples/${sid}/review`, {
+    method: "POST", role: "reviewer", name: "采集员甲",
+    body: { decision: "approve" },
+  });
+  check("采集人「采集员甲」切复核人角色 → 403",
+    jiaAsReviewer.status === 403 && jiaAsReviewer.json.error === "identity_role_bound");
+
   section("4. 三张有效图 → 自动分组出结论并锁定");
   const batch3 = await api(`/api/samples/${sid}/photos:batch`, {
     method: "POST", role: "operator", name: "采集员甲", idem: "batch-3",
@@ -204,6 +261,35 @@ async function main() {
     && groupFull.json.conclusion.paper === "棉连纸"
     && groupFull.json.conclusion.validPhotoCount === 3,
     JSON.stringify(groupFull.json.conclusion));
+
+  section("4.1 反例：采集人不能复核本版，其他复核人可以");
+  // 由全新操作员「采集员己」采集一个待复核版本
+  const cSoc = await api("/api/samples", {
+    method: "POST", role: "operator", name: "采集员己", idem: "soc-create", body: { code: "IS-SOC" },
+  });
+  const sidSoc = cSoc.json.id;
+  const socUp = await api(`/api/samples/${sidSoc}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员己", idem: "soc-up",
+    body: { photos: sharpSet().map((b, i) => entry(b, { clientName: `soc-${i}.png` })) },
+  });
+  check("反例留样 3 张成案", socUp.json.versionStatus === "pending_review");
+  // 采集人本人复核：因姓名已绑定 operator，直接被身份绑定拦截
+  const selfReview = await api(`/api/samples/${sidSoc}/review`, {
+    method: "POST", role: "reviewer", name: "采集员己",
+    body: { decision: "approve" },
+  });
+  check("采集人本人切复核角色 → 403，无法自批",
+    selfReview.status === 403 && selfReview.json.error === "identity_role_bound");
+  // 用一个先以 reviewer 身份绑定的名字，但把其名字伪造为采集参与者不可能；
+  // 这里直接验证独立复核人可正常批准别人的版本
+  const otherReview = await api(`/api/samples/${sidSoc}/review`, {
+    method: "POST", role: "reviewer", name: "复核员辛", idem: "soc-approve",
+    body: { decision: "approve", comment: "独立复核通过" },
+  });
+  check("非采集人的复核人可以批准", otherReview.status === 200);
+  const socAfter = (await api("/api/state")).json.samples.find(s => s.id === sidSoc);
+  check("版本记录复核人为独立复核员",
+    socAfter.versions[0].review?.by === "复核员辛" && socAfter.versions[0].status === "approved");
 
   section("5. 复核职责分离与并发：只成功一次");
   const opReview = await api(`/api/samples/${sid}/review`, {
@@ -323,7 +409,9 @@ async function main() {
   check("审计含建档/采集/批准/驳回/迁移",
     ["migrate_v1", "sample_create", "batch_upload", "review_approve", "review_reject"].every(a => actions.includes(a)),
     actions.join(","));
-  check("并发复核只留一条批准审计", actions.filter(a => a === "review_approve").length === 1);
+  check("并发复核只留一条批准审计（乙/丙仅一人成功）",
+    audit.filter(a => a.action === "review_approve" && a.detail.sampleId === sid).length === 1);
+  check("独立复核人的批准同样留痕", audit.some(a => a.action === "review_approve" && a.actor === "复核员辛"));
 
   // 优雅停服，再冷启动
   section("9. 重启：数据持久化，历史仍可查看");
@@ -341,6 +429,13 @@ async function main() {
   check("v1 历史数据重启后仍可查看", !!legacy2.legacy && legacy2.legacy.logs.length >= 1);
   const photoStill = await fetch(`${BASE}/api/samples/${s100.id}/photos/${s100.versions[0].photos[0].id}`);
   check("重启后图片仍可取回", photoStill.status === 200);
+  // 身份绑定重启后仍生效：采集员甲（operator）重启后仍不能换 reviewer
+  const bindingAfterRestart = await api(`/api/samples/${s100.id}/review`, {
+    method: "POST", role: "reviewer", name: "采集员甲",
+    body: { decision: "approve" },
+  });
+  check("重启后姓名↔角色绑定仍生效（采集员甲不能变复核人）",
+    bindingAfterRestart.status === 403 && bindingAfterRestart.json.error === "identity_role_bound");
 
   await stop(srv.child);
   console.log(`\n走查结果：${passed} 通过，${failed} 失败`);

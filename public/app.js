@@ -103,10 +103,17 @@ $("#newSampleBox").querySelector("#nsSubmit").addEventListener("click", async ()
   };
   if (!body.code) return alert("请填写留样编号");
   try {
-    await api("/api/samples", { method: "POST", headers: { "Idempotency-Key": newKey() }, body: JSON.stringify(body) });
+    const created = await api("/api/samples", { method: "POST", headers: { "Idempotency-Key": newKey() }, body: JSON.stringify(body) });
     $("#newSampleBox").querySelectorAll("input").forEach(i => { i.value = ""; });
     $("#newSampleBox").classList.add("hidden");
     await refreshAll();
+    // 建档后立即切到新留样，避免直接上传写错到旧样本
+    if (created?.id) {
+      state.selectedSampleId = created.id;
+      localStorage.setItem("ink.sample", created.id);
+      renderSampleSelect();
+      renderVersionHint();
+    }
   } catch (err) { alert("建档失败：" + friendly(err)); }
 });
 function renderVersionHint() {
@@ -413,6 +420,8 @@ function friendly(err) {
     idempotency_key_reused_with_different_payload: "幂等键被不同请求复用",
     sample_code_exists: "留样编号已存在",
     payload_too_large: "批次过大，请减少张数",
+    identity_role_bound: "该姓名已绑定另一角色，请使用原角色或更换姓名",
+    reviewer_is_collector: "采集人不能复核自己参与采集的版本",
   };
   return map[err.message] || err.message + (err.data?.hint ? `（${err.data.hint}）` : "");
 }

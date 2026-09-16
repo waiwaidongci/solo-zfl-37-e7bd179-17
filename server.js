@@ -1,4 +1,5 @@
 import http from "node:http";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join, extname } from "node:path";
@@ -304,7 +305,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && p === "/api/samples") {
       if (who.role !== "operator") return sendError(res, 403, "reviewer_cannot_collect");
       const input = await readBody(req);
-      const result = await idempotent(req, input, "create_sample", db => {
+      const result = await idempotent(req, input, "create_sample", who, db => {
         const code = strField(input.code);
         if (!code) throw httpError(400, "code_required");
         if (db.samples.some(s => s.code === code)) throw httpError(409, "sample_code_exists");
@@ -323,7 +324,8 @@ const server = http.createServer(async (req, res) => {
             status: "collecting",
             createdAt: now,
             createdBy: who.name,
-            submittedBy: who.name,
+            submittedBy: null,
+            contributors: [],
             groups: [],
             photos: [],
             conclusion: null,
@@ -343,7 +345,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && uploadMatch) {
       if (who.role !== "operator") return sendError(res, 403, "reviewer_cannot_collect");
       const input = await readBody(req);
-      const result = await idempotent(req, input, "batch_upload", db => {
+      const result = await idempotent(req, input, "batch_upload", who, db => {
         const sample = findSample(db, decodeURIComponent(uploadMatch[1]));
         if (!sample) throw httpError(404, "sample_not_found");
         const version = currentVersion(sample);
@@ -353,6 +355,11 @@ const server = http.createServer(async (req, res) => {
 
         const entries = Array.isArray(input.photos) ? input.photos : [];
         if (!entries.length) throw httpError(400, "empty_batch");
+
+        // 记录本版采集参与者：任何参与采集的人都不能复核本版
+        version.contributors ||= [];
+        if (!version.contributors.includes(who.name)) version.contributors.push(who.name);
+        if (!version.submittedBy) version.submittedBy = who.name;
 
         const results = [];
         let validCount = 0;
@@ -418,11 +425,16 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && reviewMatch) {
       if (who.role !== "reviewer") return sendError(res, 403, "only_reviewer_can_review");
       const input = await readBody(req);
-      const result = await idempotent(req, input, "review", db => {
+      const result = await idempotent(req, input, "review", who, db => {
         const sample = findSample(db, decodeURIComponent(reviewMatch[1]));
         if (!sample) throw httpError(404, "sample_not_found");
         const version = currentVersion(sample);
         if (version.status !== "pending_review") throw httpError(409, "version_not_pending", { status: version.status });
+        // 职责分离：参与过本版采集的人不能复核本版（即使姓名后来被误用为复核角色，
+        // 身份绑定也会先拦住；这里再按版本参与者做一道强制校验）
+        if ((version.contributors || []).includes(who.name)) {
+          throw httpError(403, "reviewer_is_collector", { hint: "采集人不能复核自己参与采集的版本" });
+        }
 
         const decision = input.decision === "approve" ? "approve" : input.decision === "reject" ? "reject" : null;
         if (!decision) throw httpError(400, "decision_required");
@@ -447,6 +459,7 @@ const server = http.createServer(async (req, res) => {
             basedOnRejectedVersion: version.version,
             rejectComment: comment,
             submittedBy: null,
+            contributors: [],
             groups: [],
             photos: [],
             conclusion: null,
@@ -490,13 +503,30 @@ function summarizeMetrics(m) {
 
 // 幂等键 + 写互斥：重复提交/并发请求整体只成功一次。
 // 首次成功的响应被缓存；键相同但载荷不同视为冲突。
-function idempotent(req, input, scope, fn) {
+// 姓名↔角色绑定在一个独立、先提交的事务里完成：即便随后业务校验失败
+// （如版本状态不对），该姓名声明的角色也已落库，不能借失败请求换角色。
+async function idempotent(req, input, scope, who, fn) {
   const key = String(req.headers["idempotency-key"] || "").trim();
+
+  await store.mutate(db => {
+    db.identities ||= {};
+    const bound = db.identities[who.name];
+    if (!bound) db.identities[who.name] = { role: who.role, boundAt: nowIso() };
+    else if (bound.role !== who.role) {
+      throw httpError(403, "identity_role_bound", { boundRole: bound.role });
+    }
+  });
+
   return store.mutate(async db => {
+    db.identities ||= {};
+    const bound = db.identities[who.name];
+    if (!bound || bound.role !== who.role) {
+      throw httpError(403, "identity_role_bound", { boundRole: bound?.role });
+    }
     if (key) {
       const rec = db.idempotency[key];
       if (rec) {
-        if (rec.scope !== scope || rec.fingerprint !== fingerprint(input)) {
+        if (rec.scope !== scope || rec.fingerprint !== fingerprint(input) || rec.actor !== who.name) {
           throw httpError(409, "idempotency_key_reused_with_different_payload");
         }
         return { status: rec.status, body: rec.body, replayed: true };
@@ -505,7 +535,7 @@ function idempotent(req, input, scope, fn) {
     const result = await fn(db);
     if (key) {
       db.idempotency[key] = {
-        scope, fingerprint: fingerprint(input),
+        scope, fingerprint: fingerprint(input), actor: who.name,
         status: result.status, body: result.body, at: nowIso(),
       };
     }
@@ -514,17 +544,9 @@ function idempotent(req, input, scope, fn) {
 }
 
 function fingerprint(input) {
-  // 仅按业务载荷指纹，避免 header 差异导致重放失败
-  const { photos, ...rest } = input || {};
-  const slimPhotos = Array.isArray(photos)
-    ? photos.map(ph => ({
-        clientName: ph.clientName, paper: ph.paper, lighting: ph.lighting, water: ph.water,
-        pxPerMm: ph.pxPerMm, markerPx: ph.markerPx, knownMm: ph.knownMm,
-        len: String(ph.dataUrl || "").length,
-        head: String(ph.dataUrl || "").slice(0, 64),
-      }))
-    : photos;
-  return JSON.stringify({ ...rest, photos: slimPhotos });
+  // 对完整业务载荷做 SHA-256：图片哪怕只差一个字节也不会被当成同载荷重放。
+  // （请求头不纳入指纹，因此同键重试不受 header 影响。）
+  return createHash("sha256").update(JSON.stringify(input ?? null)).digest("hex");
 }
 
 async function serveFile(res, path) {
