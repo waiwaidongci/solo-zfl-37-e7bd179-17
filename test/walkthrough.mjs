@@ -652,14 +652,13 @@ async function main() {
     },
     at: "2026-09-16T00:00:00.000Z",
   };
-  // 停机注入「上一版中间格式」幂等记录：fingerprintCanonical 是有缺陷的
-  // 键序无关文本摘要，fingerprintLegacy 是原始 JSON 指纹。
-  // 桩一：普通 Unicode review 载荷，用于 原样200 / 换序409 / 改值409 对照。
+  // 停机植入「三类指纹齐全」的历史记录：安全 TLV、旧文本摘要、原始 JSON。
+  // 关键回归：只要原始请求字节相同，就必须允许精确重放，不得因安全摘要字段存在而拒绝。
   const interimPayload = { decision: "approve", comment: "同意，重拍后墨色均匀" };
   const interimRaw = JSON.stringify(interimPayload);
   diskDb.idempotency["restart-interim-key"] = {
     scope: "review",
-    fingerprint: "BROKEN-TEXT-CANONICAL-HASH",
+    fingerprintSafe: canonicalHash(interimPayload),
     fingerprintCanonical: legacyCanonicalFingerprint(interimPayload),
     fingerprintLegacy: legacyFingerprint(interimPayload),
     actor: "复核员壬",
@@ -694,6 +693,19 @@ async function main() {
     actor: "复核员壬",
     status: 200,
     body: { interimInjectStub: true },
+    at: "2026-09-16T00:00:00.000Z",
+  };
+  // 仅旧文本摘要 + 原始 JSON：没有安全 TLV，字段换序不得被旧摘要放行
+  const interimCanonOnly = { decision: "approve", comment: "仅旧摘要记录" };
+  const interimCanonOnlyRaw = JSON.stringify(interimCanonOnly);
+  diskDb.idempotency["restart-interim-canon-only"] = {
+    scope: "review",
+    fingerprint: legacyFingerprint(interimCanonOnly),
+    fingerprintCanonical: legacyCanonicalFingerprint(interimCanonOnly),
+    fingerprintLegacy: legacyFingerprint(interimCanonOnly),
+    actor: "复核员壬",
+    status: 200,
+    body: { interimCanonOnlyStub: true },
     at: "2026-09-16T00:00:00.000Z",
   };
   await writeFile(join(dataDir, "ink-station.json"), JSON.stringify(diskDb));
@@ -758,19 +770,33 @@ async function main() {
   const interimExact = await api(`/api/samples/${sidRL}/review`, {
     method: "POST", role: "reviewer", name: "复核员壬", idem: "restart-interim-key", raw: interimRaw,
   });
-  check("中间格式普通记录原样请求仍可识别（200 回放）",
+  check("三类指纹记录原样请求 → 200 回放（安全字段存在不阻断 raw 精确匹配）",
     interimExact.status === 200 && interimExact.json.interimStub === true,
     String(interimExact.status));
   const interimShuffled = await api(`/api/samples/${sidRL}/review`, {
     method: "POST", role: "reviewer", name: "复核员壬", idem: "restart-interim-key",
     raw: JSON.stringify({ comment: "同意，重拍后墨色均匀", decision: "approve" }),
   });
-  check("中间格式普通记录字段换序 → 409（旧摘要不再放行）", interimShuffled.status === 409);
+  check("三类指纹记录字段换序 → 200（由安全 TLV 摘要放行，旧文本摘要不参与）",
+    interimShuffled.status === 200, String(interimShuffled.status));
   const interimChanged = await api(`/api/samples/${sidRL}/review`, {
     method: "POST", role: "reviewer", name: "复核员壬", idem: "restart-interim-key",
     body: { decision: "reject", comment: "同意，重拍后墨色均匀" },
   });
-  check("中间格式记录内容真实变化 → 409", interimChanged.status === 409);
+  check("三类指纹记录内容真实变化 → 409", interimChanged.status === 409);
+
+  // 无安全 TLV 的旧记录：原始 JSON 可精确命中，字段换序不能借旧文本摘要命中
+  const canonOnlyExact = await api(`/api/samples/${sidRL}/review`, {
+    method: "POST", role: "reviewer", name: "复核员壬", idem: "restart-interim-canon-only", raw: interimCanonOnlyRaw,
+  });
+  check("仅旧摘要记录原样请求 → 200（原始 JSON 精确命中）",
+    canonOnlyExact.status === 200 && canonOnlyExact.json.interimCanonOnlyStub === true);
+  const canonOnlyShuffled = await api(`/api/samples/${sidRL}/review`, {
+    method: "POST", role: "reviewer", name: "复核员壬", idem: "restart-interim-canon-only",
+    raw: JSON.stringify({ comment: "仅旧摘要记录", decision: "approve" }),
+  });
+  check("仅旧摘要记录字段换序 → 409（旧文本摘要不参与等价判断）",
+    canonOnlyShuffled.status === 409, String(canonOnlyShuffled.status));
   // 分隔符注入对照：与诚实载荷旧摘要精确碰撞的伪造载荷，不得被当重放
   const interimInject = await api(`/api/samples/${sidRL}/review`, {
     method: "POST", role: "reviewer", name: "复核员壬", idem: "restart-interim-inject",

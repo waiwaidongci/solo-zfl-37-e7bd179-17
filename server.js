@@ -528,19 +528,16 @@ async function idempotent(req, input, scope, who, fn) {
       if (rec) {
         const safe = fingerprint(input);       // TLV UTF-16 码元（无注入、无代理碰撞）
         const raw = legacyFingerprint(input);  // 原始 JSON（键序敏感；代理被 \uXXXX 转义）
-        // 匹配通道（两条，互不混用）：
-        //  1) 新记录的安全 TLV 指纹：字段换序算重放，分隔符/代理串无法注入；
-        //  2) 老记录（最老 v0 或中间版本）一律只接受原始 JSON 指纹精确相等。
-        //     中间版本即使带「键序无关文本摘要」也不再作为依据——它无法仅凭
-        //     哈希证明内容相同（分隔符注入、孤立代理码元都会让不同对象摘要相同）。
+        // 匹配通道（旧文本摘要 fingerprintCanonical 永不参与判断）：
+        //  1) 安全 TLV 指纹：新记录支持字段换序，分隔符/代理串无法注入；
+        //  2) 原始 JSON 指纹：任何历史记录都允许「同一请求原样重试」精确命中，
+        //     不因其同时带 fingerprintSafe 等字段而被排除；字段换序/注入/代理碰撞不命中。
         const safeMatch = rec.fingerprintSafe === safe || rec.fingerprint === safe;
-        const exactLegacyMatch = !rec.fingerprintSafe && (
-          rec.fingerprintLegacy
-            ? raw === rec.fingerprintLegacy
-            : raw === rec.fingerprint
-        );
+        const exactJsonMatch = rec.fingerprintLegacy
+          ? raw === rec.fingerprintLegacy
+          : raw === rec.fingerprint;
         if (rec.scope !== scope || rec.actor !== who.name
-          || !(safeMatch || exactLegacyMatch)) {
+          || !(safeMatch || exactJsonMatch)) {
           throw httpError(409, "idempotency_key_reused_with_different_payload");
         }
         return { status: rec.status, body: rec.body, replayed: true };
