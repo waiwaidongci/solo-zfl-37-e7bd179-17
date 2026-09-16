@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
 
 import { sharpSet, blurryPng, blankSheet, garbagePng, fourthPng, fifthPng, lookalikePair, dataUrl } from "./fixtures.mjs";
-import { canonicalHash, legacyFingerprint, legacyCanonicalFingerprint } from "../lib/canonical.js";
+import { canonicalHash, legacyFingerprint, legacyCanonicalFingerprint, firstNonFinitePath } from "../lib/canonical.js";
 import { createHash } from "node:crypto";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -414,6 +414,70 @@ async function main() {
   });
   check("采集人「采集员甲」切复核人角色 → 403",
     jiaAsReviewer.status === 403 && jiaAsReviewer.json.error === "identity_role_bound");
+
+  section("3.4 非有限 JSON 数字：指纹前拒绝且不写库");
+  check("单元：递归检出 Infinity/-Infinity/NaN 的路径",
+    firstNonFinitePath({ a: { b: [1, { c: 1e999 }] } }) === "$.a.b[1].c"
+    && firstNonFinitePath({ a: [1, -1e999] }) === "$.a[1]"
+    && firstNonFinitePath({ a: NaN }) === "$.a" // NaN 无法经标准 JSON 体到达，仅纯函数防御
+    && firstNonFinitePath({ ok: -0, tiny: 1e-999, big: 9007199254740993, max: 1e308 }) === null);
+
+  const nonFiniteCases = [
+    ["nonfinite-k1", "顶层指数溢出", '{"code":"IS-INF1","ageYears":1e999}'],
+    ["nonfinite-k2", "深层负指数溢出", '{"code":"IS-INF2","meta":{"x":[-1e999]}}'],
+    ["nonfinite-k3", "数组内指数溢出", '{"code":"IS-INF3","vals":[1,2,1e400]}'],
+    ["nonfinite-k4", "负向溢出", '{"code":"IS-INF5","ageYears":-1.7976931348623157e309}'],
+  ];
+  for (const [idem, label, raw] of nonFiniteCases) {
+    const r = await api("/api/samples", {
+      method: "POST", role: "operator", name: "采集员丁", idem, raw,
+    });
+    check(label + " → 400 non_finite_number",
+      r.status === 400 && r.json.error === "non_finite_number",
+      `${r.status} ${JSON.stringify(r.json.error)}`);
+  }
+  // 原始体为 -0e999（解析为有限 0）：应被正常接受，证明只拦截非有限值
+  const negZeroExp = await api("/api/samples", {
+    method: "POST", role: "operator", name: "采集员丁", idem: "nonfinite-negzeroexp",
+    raw: '{"code":"IS-INF4","ageYears":-0e999}',
+  });
+  check("-0e999（解析为有限 0）→ 201", negZeroExp.status === 201 && negZeroExp.json.ageYears === 0,
+    `${negZeroExp.status} ${negZeroExp.json.ageYears}`);
+  // 非有限请求不得毒化幂等键：同键随后提交一个合法请求必须成功
+  const afterNonFinite = await api("/api/samples", {
+    method: "POST", role: "operator", name: "采集员丁", idem: "nonfinite-k1",
+    body: { code: "IS-AFTER-INF" },
+  });
+  check("非有限失败后同幂等键的合法请求仍成功（失败未写幂等记录）",
+    afterNonFinite.status === 201, String(afterNonFinite.status));
+  // 非有限请求不得写入身份绑定：新人以 reviewer 身份发非有限请求（review 端点允许该角色）
+  const freshBad = await api(`/api/samples/${sid}/review`, {
+    method: "POST", role: "reviewer", name: "超限数庚", idem: "nonfinite-fresh",
+    raw: '{"decision":"approve","x":1e999}',
+  });
+  const freshGood = await api("/api/samples", {
+    method: "POST", role: "operator", name: "超限数庚", idem: "nonfinite-fresh-ok",
+    body: { code: "IS-FRESH-OK" },
+  });
+  check("非有限失败不绑定身份（reviewer 失败后同名人可作 operator）",
+    freshBad.status === 400 && freshGood.status === 201,
+    JSON.stringify([freshBad.status, freshGood.status]));
+
+  // 边界数值：-0、下溢为 0、大整数、最大有限指数均按普通 JSON 数值接受
+  const boundary = [
+    ["IS-NUM-NEGZERO", { ageYears: -0 }],
+    ["IS-NUM-TINY", { ageYears: 1e-999 }],
+    ["IS-NUM-BIGINT", { ageYears: 9007199254740993 }],
+    ["IS-NUM-MAXFIN", { ageYears: 1e308 }],
+  ];
+  for (const [code, extra] of boundary) {
+    const r = await api("/api/samples", {
+      method: "POST", role: "operator", name: "采集员丁", idem: "boundary-" + code,
+      body: { code, ...extra },
+    });
+    check("边界数值被接受：" + code, r.status === 201 && Number.isFinite(r.json.ageYears),
+      `${r.status} ${r.json.ageYears}`);
+  }
 
   section("4. 三张有效图 → 自动分组出结论并锁定");
   const batch3 = await api(`/api/samples/${sid}/photos:batch`, {
@@ -840,6 +904,16 @@ async function main() {
     body: { photos: [surrPhoto1], note: "代理码元" },
   });
   check("重启后含代理码元的同内容换序重放仍 201", surrAfterReplay.status === 201);
+
+  // 重启后：非有限数字仍在进入指纹/业务前被 400 拒绝，不触发版本状态机
+  const nonFiniteAfterRestart = await api(`/api/samples/${sidRL}/review`, {
+    method: "POST", role: "reviewer", name: "复核员壬", idem: "restart-nonfinite",
+    raw: '{"decision":"approve","meta":1e999}',
+  });
+  check("重启后非有限 JSON 数字 → 400 且非 500",
+    nonFiniteAfterRestart.status === 400
+    && nonFiniteAfterRestart.json.error === "non_finite_number",
+    String(nonFiniteAfterRestart.status));
 
   await stop(srv.child);
   console.log(`\n走查结果：${passed} 通过，${failed} 失败`);

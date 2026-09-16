@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { Store, nowIso, newId, groupKeyOf } from "./lib/store.js";
 import { decode } from "./lib/png.js";
 import { analyzeImage, judge, hammingDistance } from "./lib/imaging.js";
-import { canonicalHash, legacyFingerprint } from "./lib/canonical.js";
+import { canonicalHash, legacyFingerprint, firstNonFinitePath } from "./lib/canonical.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dataDir = process.env.DATA_DIR || join(__dirname, "data");
@@ -507,6 +507,15 @@ function summarizeMetrics(m) {
 // （如版本状态不对），该姓名声明的角色也已落库，不能借失败请求换角色。
 async function idempotent(req, input, scope, who, fn) {
   const key = String(req.headers["idempotency-key"] || "").trim();
+
+  // 先于指纹与任何写事务：拒绝非有限 JSON 数字。
+  // Node 的 JSON.parse 对超大指数（如 1e999）会得到 Infinity/-Infinity，
+  // 若继续走 TLV 指纹会抛内部异常。这里明确返回 400，且不写身份绑定、
+  // 不写幂等记录、不进入业务事务。
+  const badPath = firstNonFinitePath(input);
+  if (badPath !== null) {
+    throw httpError(400, "non_finite_number", { path: badPath });
+  }
 
   await store.mutate(db => {
     db.identities ||= {};
