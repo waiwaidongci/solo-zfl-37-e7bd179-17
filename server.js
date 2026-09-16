@@ -7,9 +7,7 @@ import { fileURLToPath } from "node:url";
 import { Store, nowIso, newId, groupKeyOf } from "./lib/store.js";
 import { decode } from "./lib/png.js";
 import { analyzeImage, judge, hammingDistance } from "./lib/imaging.js";
-import {
-  canonicalHash, legacyFingerprint, legacyCanonicalFingerprint, hasLoneSurrogate,
-} from "./lib/canonical.js";
+import { canonicalHash, legacyFingerprint } from "./lib/canonical.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dataDir = process.env.DATA_DIR || join(__dirname, "data");
@@ -530,22 +528,19 @@ async function idempotent(req, input, scope, who, fn) {
       if (rec) {
         const safe = fingerprint(input);       // TLV UTF-16 码元（无注入、无代理碰撞）
         const raw = legacyFingerprint(input);  // 原始 JSON（键序敏感；代理被 \uXXXX 转义）
-        // 命中通道：
-        //  1) 新记录：安全 TLV 指纹（字段换序也算重放，分隔符与代理串均无法注入）
-        //  2) 最老 v0 记录（只有 fingerprint=原始 JSON）：原样重发命中
-        //  3) 升级版记录带 fingerprintLegacy：原样重发命中
-        //  4) 中间版记录带 fingerprintCanonical（文本分隔符摘要，键序无关）：
-        //     仅当载荷不含任何孤立代理码元时才按旧摘要匹配——该摘要会把不同
-        //     孤立代理码元塌成同一替换字符，放开会重新引入碰撞。
+        // 匹配通道（两条，互不混用）：
+        //  1) 新记录的安全 TLV 指纹：字段换序算重放，分隔符/代理串无法注入；
+        //  2) 老记录（最老 v0 或中间版本）一律只接受原始 JSON 指纹精确相等。
+        //     中间版本即使带「键序无关文本摘要」也不再作为依据——它无法仅凭
+        //     哈希证明内容相同（分隔符注入、孤立代理码元都会让不同对象摘要相同）。
         const safeMatch = rec.fingerprintSafe === safe || rec.fingerprint === safe;
-        const rawMatch = rec.fingerprintLegacy
-          ? raw === rec.fingerprintLegacy
-          : raw === rec.fingerprint;
-        const oldCanonMatch = !!rec.fingerprintCanonical
-          && !hasLoneSurrogate(input)
-          && legacyCanonicalFingerprint(input) === rec.fingerprintCanonical;
+        const exactLegacyMatch = !rec.fingerprintSafe && (
+          rec.fingerprintLegacy
+            ? raw === rec.fingerprintLegacy
+            : raw === rec.fingerprint
+        );
         if (rec.scope !== scope || rec.actor !== who.name
-          || !(safeMatch || rawMatch || oldCanonMatch)) {
+          || !(safeMatch || exactLegacyMatch)) {
           throw httpError(409, "idempotency_key_reused_with_different_payload");
         }
         return { status: rec.status, body: rec.body, replayed: true };
