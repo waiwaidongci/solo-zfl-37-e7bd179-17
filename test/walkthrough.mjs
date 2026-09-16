@@ -11,6 +11,7 @@ import { dirname } from "node:path";
 
 import { sharpSet, blurryPng, blankSheet, garbagePng, fourthPng, fifthPng, lookalikePair, dataUrl } from "./fixtures.mjs";
 import { canonicalHash, legacyFingerprint } from "../lib/canonical.js";
+import { createHash } from "node:crypto";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
@@ -209,6 +210,40 @@ async function main() {
   check("单元：旧指纹确实对键序敏感（证明需要兼容双通道）",
     legacyFingerprint(payload1) !== legacyFingerprint(payloadShuffled));
 
+  // —— 字符串边界碰撞反例：含分隔符的字符串不得伪造出别的对象结构 ——
+  // 复刻被替换掉的「文本分隔符」规范化算法，用于证明旧碰撞确实存在
+  function buggyCanonicalize(value) {
+    if (value === null) return "0:";
+    const t = typeof value;
+    if (t === "string") return "s:" + value;
+    if (t === "number") return "n:" + String(value);
+    if (t === "boolean") return "b:" + (value ? "1" : "0");
+    if (Array.isArray(value)) return "A:[" + value.map(buggyCanonicalize).join(",") + "]";
+    return "O:{" + Object.keys(value).sort()
+      .map(k => JSON.stringify(k) + "=" + buggyCanonicalize(value[k])).join(",") + "}";
+  }
+  const buggyHash = v => createHash("sha256").update(buggyCanonicalize(v)).digest("hex");
+  const injectString = '1,"b"=n:2'; // 字符串内容里嵌入另一个字段的规范化片段
+  const collideX = { a: injectString };
+  const collideY = { a: "1", b: 2 };
+  check("旧算法复现：注入字符串与真实双字段碰撞",
+    buggyCanonicalize(collideX) === buggyCanonicalize(collideY)
+    && buggyHash(collideX) === buggyHash(collideY));
+  check("新 TLV：同一对载荷不再碰撞", canonicalHash(collideX) !== canonicalHash(collideY));
+  // 分隔符字符的全覆盖：逗号/引号/等号/冒号/括号/类型标记
+  const weird = 's:1, "k"=n:9 ]} [ { a:b:c ,\n\t\r""""';
+  check("单元：含全套分隔符的字符串与伪造结构不碰撞",
+    canonicalHash({ a: weird }) !== canonicalHash({ a: "s:1, ", k: 9 })
+    && canonicalHash({ a: weird }) !== canonicalHash({ a: weird + "x" }));
+  check("单元：分隔符字符串换字段顺序仍相等",
+    canonicalHash({ a: weird, z: [1, weird, null] }) === canonicalHash({ z: [1, weird, null], a: weird }));
+  check("单元：数字字符串与数字、布尔不碰撞",
+    canonicalHash({ a: "5" }) !== canonicalHash({ a: 5 })
+    && canonicalHash({ a: "true" }) !== canonicalHash({ a: true })
+    && canonicalHash({ a: "null" }) !== canonicalHash({ a: null }));
+  check("单元：空串/空数组/空对象可区分",
+    new Set([canonicalHash({ a: "" }), canonicalHash({ a: [] }), canonicalHash({ a: {} }), canonicalHash({})]).size === 4);
+
   // —— HTTP 反例 1：字段书写顺序不同、业务内容相同 → 视为同载荷重放 ——
   const cCanon = await api("/api/samples", {
     method: "POST", role: "operator", name: "采集员丁", idem: "canon-create", body: { code: "IS-CANON" },
@@ -262,6 +297,38 @@ async function main() {
 
   // —— HTTP 反例 3 已在 3.1 覆盖：等长同前缀图片仅尾部不同 → 409 ——
   check("反例3：图片字节真实变化 → 409（见 3.1 lookalike 用例）", secondLook.status === 409);
+
+  // —— HTTP 反例 4：分隔符字符串注入伪造结构，同键第二次不得当重放 ——
+  const cInj = await api("/api/samples", {
+    method: "POST", role: "operator", name: "采集员丁", idem: "inj-create", body: { code: "IS-INJ" },
+  });
+  const sidInj = cInj.json.id;
+  const sharedPhoto = entry(lookB, { clientName: "inj.png" });
+  // 精确碰撞对（与单元级同形态）：A 的 tag 字符串吞掉 B 多出的 z 字段
+  const injHonest = { photos: [sharedPhoto], tag: 'x,"z"=s:y' }; // 单 tag，字符串内含伪造片段
+  const injForged = { photos: [sharedPhoto], tag: "x", z: "y" }; // 实际多一个 z 字段
+  check("旧算法 HTTP 形态确实碰撞（回归基准）",
+    buggyCanonicalize(injHonest) === buggyCanonicalize(injForged)
+    && buggyHash(injHonest) === buggyHash(injForged));
+  const injFirst = await api(`/api/samples/${sidInj}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "inj-key", body: injHonest,
+  });
+  check("注入反例：首单提交成功", injFirst.status === 201 && injFirst.json.results[0].valid === true);
+  const injSecond = await api(`/api/samples/${sidInj}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "inj-key", body: injForged,
+  });
+  check("反例4：字符串含逗号/引号/等号伪造字段 → 409，不当重放", injSecond.status === 409
+    && injSecond.json.error.includes("idempotency"), String(injSecond.status) + " " + JSON.stringify(injSecond.json?.error));
+  // 含分隔符的真实重放（同样是注入字符串，但字段书写顺序打乱、内容一致）必须仍成功
+  const injShuffled = { tag: 'x,"z"=s:y', photos: [Object.fromEntries(Object.entries(sharedPhoto).reverse())] };
+  const injReplay = await api(`/api/samples/${sidInj}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "inj-key", body: injShuffled,
+  });
+  const injState = (await api("/api/state")).json.samples.find(s => s.id === sidInj);
+  check("含分隔符字符串的同内容换序重放 → 201 且不新增图片",
+    injReplay.status === 201 && injState.versions[0].photos.length === 1,
+    JSON.stringify({ r: injReplay.status, n: injState.versions[0].photos.length }));
+
 
   section("3.3 反例：姓名↔角色稳定绑定，换角色被拒");
   // 新姓名先用复核人身份
@@ -522,6 +589,19 @@ async function main() {
     },
     at: "2026-09-16T00:00:00.000Z",
   };
+  // 停机注入一条「上一版中间格式」幂等记录：fingerprint 是有碰撞缺陷的文本指纹，
+  // 但同时存了 fingerprintLegacy（原始 JSON 指纹）。
+  const interimPayload = { note: "中间格式", photos: [entry(fifthPng(), { clientName: "interim.png" })] };
+  const interimRaw = JSON.stringify(interimPayload);
+  diskDb.idempotency["restart-interim-key"] = {
+    scope: "batch_upload",
+    fingerprint: "BROKEN-TEXT-CANONICAL-HASH", // 模拟中间版本写入的不可信文本指纹
+    fingerprintLegacy: legacyFingerprint(interimPayload),
+    actor: "采集员丁",
+    status: 201,
+    body: { sampleId: sidRL, version: 1, results: [{ clientName: "interim.png" }], interimStub: true },
+    at: "2026-09-16T00:00:00.000Z",
+  };
   await writeFile(join(dataDir, "ink-station.json"), JSON.stringify(diskDb));
 
   srv = await startServer(dataDir, { faults: true });
@@ -569,6 +649,29 @@ async function main() {
   check("旧格式记录换字段顺序 → 409（旧记录维持严格识别）", legacyShuffled.status === 409);
   const rlState = (await api("/api/state")).json.samples.find(s => s.id === sidRL);
   check("旧记录回放没有真正写入图片", rlState.versions[0].photos.length === 0);
+
+  // 重启后：分隔符注入攻击仍被拦截；含分隔符的合法换序重放仍命中
+  const injForgedAfter = await api(`/api/samples/${sidInj}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "inj-key", body: injForged,
+  });
+  check("重启后注入碰撞仍 409", injForgedAfter.status === 409);
+  const injShuffledAfter = await api(`/api/samples/${sidInj}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "inj-key", body: injShuffled,
+  });
+  check("重启后含分隔符的同内容换序重放仍命中", injShuffledAfter.status === 201);
+
+  // 重启后：上一版中间格式（不可信文本指纹）记录——原样 JSON 仍经 raw 通道识别，
+  // 但任何不同载荷（含分隔符注入）都不会借其重放
+  const interimExact = await api(`/api/samples/${sidRL}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "restart-interim-key", raw: interimRaw,
+  });
+  check("中间格式记录原样请求仍可识别（201 回放）",
+    interimExact.status === 201 && interimExact.json.interimStub === true);
+  const interimForged = await api(`/api/samples/${sidRL}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "restart-interim-key",
+    body: { ...interimPayload, tag: 'x","z":"y', z: "y" },
+  });
+  check("中间格式记录换载荷/注入 → 409", interimForged.status === 409);
 
   await stop(srv.child);
   console.log(`\n走查结果：${passed} 通过，${failed} 失败`);

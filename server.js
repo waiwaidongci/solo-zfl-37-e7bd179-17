@@ -526,15 +526,19 @@ async function idempotent(req, input, scope, who, fn) {
     if (key) {
       const rec = db.idempotency[key];
       if (rec) {
-        const fpCanonical = fingerprint(input);
-        const fpLegacy = legacyFingerprint(input);
-        // 命中条件：规范化指纹一致（字段换序也算重放），或旧指纹一致
-        // （原样重发，且兼容升级前已落库、只存旧指纹的记录）。
-        const samePayload = rec.fingerprint === fpCanonical
-          || rec.fingerprintCanonical === fpCanonical
-          || rec.fingerprint === fpLegacy
-          || rec.fingerprintLegacy === fpLegacy;
-        if (rec.scope !== scope || rec.actor !== who.name || !samePayload) {
+        const safe = fingerprint(input);       // TLV 规范化（无分隔符注入）
+        const raw = legacyFingerprint(input);  // 原始 JSON（键序敏感）
+        // 命中条件：
+        //  1) 新记录：安全 TLV 指纹一致（字段换序也算重放，分隔符字符串无法注入）
+        //  2) 旧记录原样重发：
+        //     - 升级版记录存了 fingerprintLegacy（原始 JSON 指纹）
+        //     - 最老的 v0 记录只有 fingerprint（即原始 JSON 指纹）
+        // 不再匹配曾经有碰撞缺陷的文本型 canonical 指纹。
+        const safeMatch = rec.fingerprintSafe === safe || rec.fingerprint === safe;
+        const rawMatch = rec.fingerprintLegacy
+          ? raw === rec.fingerprintLegacy
+          : raw === rec.fingerprint;
+        if (rec.scope !== scope || rec.actor !== who.name || !(safeMatch || rawMatch)) {
           throw httpError(409, "idempotency_key_reused_with_different_payload");
         }
         return { status: rec.status, body: rec.body, replayed: true };
@@ -544,8 +548,8 @@ async function idempotent(req, input, scope, who, fn) {
     if (key) {
       db.idempotency[key] = {
         scope,
-        fingerprint: fingerprint(input),
-        fingerprintCanonical: fingerprint(input),
+        fingerprint: fingerprint(input),        // = fingerprintSafe，主通道
+        fingerprintSafe: fingerprint(input),
         fingerprintLegacy: legacyFingerprint(input),
         actor: who.name,
         status: result.status, body: result.body, at: nowIso(),
