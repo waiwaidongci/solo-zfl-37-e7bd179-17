@@ -243,6 +243,20 @@ async function main() {
     && canonicalHash({ a: "null" }) !== canonicalHash({ a: null }));
   check("单元：空串/空数组/空对象可区分",
     new Set([canonicalHash({ a: "" }), canonicalHash({ a: [] }), canonicalHash({ a: {} }), canonicalHash({})]).size === 4);
+  // —— 孤立代理码元（lone surrogate）保真：不能都塌成替换字符 U+FFFD ——
+  const surr1 = { tag: "a\uD800z" };
+  const surr2 = { tag: "a\uD801z" };
+  check("单元：不同孤立代理码元（值）指纹不同", canonicalHash(surr1) !== canonicalHash(surr2));
+  check("单元：孤立高/低代理、不同位置均区分",
+    canonicalHash({ x: "\uD800" }) !== canonicalHash({ x: "\uDC00" })
+    && canonicalHash({ x: "x\uD800" }) !== canonicalHash({ x: "\uD800x" })
+    && canonicalHash({ ["k\uD800"]: 1 }) !== canonicalHash({ ["k\uD801"]: 1 })); // 键名
+  check("单元：普通字符与 emoji 代理对不受影响",
+    canonicalHash({ x: "中文" }) !== canonicalHash({ x: "😀" })
+    && canonicalHash({ x: "𐀀" }) !== canonicalHash({ x: "𐀁" }));
+  check("单元：含代理码元的字符串换字段序仍相等",
+    canonicalHash({ a: "\uD800,\":1", z: [1, "\uDCFF", null] })
+      === canonicalHash({ z: [1, "\uDCFF", null], a: "\uD800,\":1" }));
 
   // —— HTTP 反例 1：字段书写顺序不同、业务内容相同 → 视为同载荷重放 ——
   const cCanon = await api("/api/samples", {
@@ -328,6 +342,45 @@ async function main() {
   check("含分隔符字符串的同内容换序重放 → 201 且不新增图片",
     injReplay.status === 201 && injState.versions[0].photos.length === 1,
     JSON.stringify({ r: injReplay.status, n: injState.versions[0].photos.length }));
+
+  // —— HTTP 反例 5：不同孤立代理码元（值与键名）同键不得当重放 ——
+  const cSurr = await api("/api/samples", {
+    method: "POST", role: "operator", name: "采集员丁", idem: "surr-create", body: { code: "IS-SURR" },
+  });
+  const sidSurr = cSurr.json.id;
+  const surrPhoto1 = { ...sharedPhoto, clientName: "su-a\uD800.png" };
+  const surrPhoto2 = { ...sharedPhoto, clientName: "su-a\uD801.png" };
+  const surrFirst = await api(`/api/samples/${sidSurr}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "surr-key",
+    body: { note: "代理码元", photos: [surrPhoto1] },
+  });
+  check("反例5：含孤立代理码元的值首次提交 201", surrFirst.status === 201);
+  const surrSecond = await api(`/api/samples/${sidSurr}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "surr-key",
+    body: { note: "代理码元", photos: [surrPhoto2] }, // 仅代理码元不同
+  });
+  check("反例5：值中不同孤立代理码元 → 409，不当重放", surrSecond.status === 409
+    && surrSecond.json.error.includes("idempotency"), String(surrSecond.status));
+  // 原样重放（含孤立代理）仍命中
+  const surrReplay = await api(`/api/samples/${sidSurr}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "surr-key",
+    body: { photos: [surrPhoto1], note: "代理码元" }, // 字段顺序也换了
+  });
+  const surrState = (await api("/api/state")).json.samples.find(s => s.id === sidSurr);
+  check("含代理码元的同内容换序重放 → 201 且不新增图片",
+    surrReplay.status === 201 && surrState.versions[0].photos.length === 1);
+  // 键名中的孤立代理码元差异
+  const surrKeyA = await api(`/api/samples/${sidSurr}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "surr-key2",
+    raw: JSON.stringify({ photos: [sharedPhoto], ["note\uD800"]: "k" }),
+  });
+  const surrKeyB = await api(`/api/samples/${sidSurr}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "surr-key2",
+    raw: JSON.stringify({ photos: [sharedPhoto], ["note\uD801"]: "k" }),
+  });
+  check("反例5：键名中不同孤立代理码元 → 先 201 后 409",
+    surrKeyA.status === 201 && surrKeyB.status === 409,
+    JSON.stringify([surrKeyA.status, surrKeyB.status]));
 
 
   section("3.3 反例：姓名↔角色稳定绑定，换角色被拒");
@@ -672,6 +725,18 @@ async function main() {
     body: { ...interimPayload, tag: 'x","z":"y', z: "y" },
   });
   check("中间格式记录换载荷/注入 → 409", interimForged.status === 409);
+
+  // 重启后：孤立代理码元差异仍可区分、原样（含字段换序）仍可重放
+  const surrAfterDifferent = await api(`/api/samples/${sidSurr}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "surr-key",
+    body: { note: "代理码元", photos: [surrPhoto2] },
+  });
+  check("重启后不同孤立代理码元仍 409", surrAfterDifferent.status === 409);
+  const surrAfterReplay = await api(`/api/samples/${sidSurr}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "surr-key",
+    body: { photos: [surrPhoto1], note: "代理码元" },
+  });
+  check("重启后含代理码元的同内容换序重放仍 201", surrAfterReplay.status === 201);
 
   await stop(srv.child);
   console.log(`\n走查结果：${passed} 通过，${failed} 失败`);
