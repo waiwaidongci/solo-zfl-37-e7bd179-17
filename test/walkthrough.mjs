@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
 
 import { sharpSet, blurryPng, blankSheet, garbagePng, fourthPng, fifthPng, lookalikePair, dataUrl } from "./fixtures.mjs";
-import { canonicalHash, legacyFingerprint } from "../lib/canonical.js";
+import { canonicalHash, legacyFingerprint, legacyCanonicalFingerprint, hasLoneSurrogate } from "../lib/canonical.js";
 import { createHash } from "node:crypto";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -257,6 +257,17 @@ async function main() {
   check("单元：含代理码元的字符串换字段序仍相等",
     canonicalHash({ a: "\uD800,\":1", z: [1, "\uDCFF", null] })
       === canonicalHash({ z: [1, "\uDCFF", null], a: "\uD800,\":1" }));
+  // —— 旧摘要通道的护栏：普通换序相等，孤立代理会碰撞（因此必须先扫描再放行）——
+  check("单元：旧文本摘要对普通 Unicode 换序相等",
+    legacyCanonicalFingerprint({ decision: "approve", comment: "同意，重拍" })
+      === legacyCanonicalFingerprint({ comment: "同意，重拍", decision: "approve" }));
+  check("单元：旧文本摘要对不同孤立代理碰撞（护栏必要性）",
+    legacyCanonicalFingerprint({ c: "x\uD800" })
+      === legacyCanonicalFingerprint({ c: "x\uD801" }));
+  check("单元：孤立代理扫描（合法 emoji 代理对不算）",
+    hasLoneSurrogate({ c: "x\uD800" }) === true
+    && hasLoneSurrogate({ ["k\uDC00"]: 1 }) === true
+    && hasLoneSurrogate({ c: "普通😀emoji", n: 3, a: [1, null, true] }) === false);
 
   // —— HTTP 反例 1：字段书写顺序不同、业务内容相同 → 视为同载荷重放 ——
   const cCanon = await api("/api/samples", {
@@ -642,19 +653,36 @@ async function main() {
     },
     at: "2026-09-16T00:00:00.000Z",
   };
-  // 停机注入一条「上一版中间格式」幂等记录：fingerprint 是有碰撞缺陷的文本指纹，
-  // 但同时存了 fingerprintLegacy（原始 JSON 指纹）。
-  const interimPayload = { note: "中间格式", photos: [entry(fifthPng(), { clientName: "interim.png" })] };
+  // 停机注入一条「上一版中间格式」幂等记录：fingerprintCanonical 是有缺陷的
+  // 文本分隔符规范化摘要（键序无关），fingerprintLegacy 是原始 JSON 指纹。
+  // 用 review 作用域，载荷是普通 Unicode，便于做换序重放对照。
+  const interimPayload = { decision: "approve", comment: "同意，重拍后墨色均匀" };
   const interimRaw = JSON.stringify(interimPayload);
   diskDb.idempotency["restart-interim-key"] = {
-    scope: "batch_upload",
-    fingerprint: "BROKEN-TEXT-CANONICAL-HASH", // 模拟中间版本写入的不可信文本指纹
+    scope: "review",
+    fingerprint: "BROKEN-TEXT-CANONICAL-HASH",
+    fingerprintCanonical: legacyCanonicalFingerprint(interimPayload),
     fingerprintLegacy: legacyFingerprint(interimPayload),
-    actor: "采集员丁",
-    status: 201,
-    body: { sampleId: sidRL, version: 1, results: [{ clientName: "interim.png" }], interimStub: true },
+    actor: "复核员壬",
+    status: 200,
+    body: { interimStub: true },
     at: "2026-09-16T00:00:00.000Z",
   };
+  // 另一条含孤立代理码元的中间格式记录（旧摘要下会与不同码元碰撞，必须拒绝）
+  const interimSurrogateA = { decision: "reject", comment: "边缘发虚\uD800" };
+  const interimSurrogateRaw = JSON.stringify(interimSurrogateA);
+  diskDb.idempotency["restart-interim-surr"] = {
+    scope: "review",
+    fingerprint: "BROKEN-TEXT-CANONICAL-HASH",
+    fingerprintCanonical: legacyCanonicalFingerprint(interimSurrogateA),
+    fingerprintLegacy: legacyFingerprint(interimSurrogateA),
+    actor: "复核员壬",
+    status: 200,
+    body: { interimSurrStub: true },
+    at: "2026-09-16T00:00:00.000Z",
+  };
+  // 双引号注入对照桩保留为普通中间格式记录（与 restart-interim-key 同类），
+  // 其注入风险由新记录 TLV 指纹与原始 JSON 通道覆盖，此处不重复。
   await writeFile(join(dataDir, "ink-station.json"), JSON.stringify(diskDb));
 
   srv = await startServer(dataDir, { faults: true });
@@ -713,18 +741,41 @@ async function main() {
   });
   check("重启后含分隔符的同内容换序重放仍命中", injShuffledAfter.status === 201);
 
-  // 重启后：上一版中间格式（不可信文本指纹）记录——原样 JSON 仍经 raw 通道识别，
-  // 但任何不同载荷（含分隔符注入）都不会借其重放
-  const interimExact = await api(`/api/samples/${sidRL}/photos:batch`, {
-    method: "POST", role: "operator", name: "采集员丁", idem: "restart-interim-key", raw: interimRaw,
+  // 重启后：上一版中间格式记录（普通 Unicode）——字段换序重放经旧摘要通道识别
+  const interimExact = await api(`/api/samples/${sidRL}/review`, {
+    method: "POST", role: "reviewer", name: "复核员壬", idem: "restart-interim-key", raw: interimRaw,
   });
-  check("中间格式记录原样请求仍可识别（201 回放）",
-    interimExact.status === 201 && interimExact.json.interimStub === true);
-  const interimForged = await api(`/api/samples/${sidRL}/photos:batch`, {
-    method: "POST", role: "operator", name: "采集员丁", idem: "restart-interim-key",
-    body: { ...interimPayload, tag: 'x","z":"y', z: "y" },
+  check("中间格式普通记录原样请求仍可识别（200 回放）",
+    interimExact.status === 200 && interimExact.json.interimStub === true,
+    String(interimExact.status));
+  const interimShuffled = await api(`/api/samples/${sidRL}/review`, {
+    method: "POST", role: "reviewer", name: "复核员壬", idem: "restart-interim-key",
+    raw: JSON.stringify({ comment: "同意，重拍后墨色均匀", decision: "approve" }),
   });
-  check("中间格式记录换载荷/注入 → 409", interimForged.status === 409);
+  check("中间格式普通记录字段换序 → 200（旧摘要继续识别）", interimShuffled.status === 200);
+  const interimChanged = await api(`/api/samples/${sidRL}/review`, {
+    method: "POST", role: "reviewer", name: "复核员壬", idem: "restart-interim-key",
+    body: { decision: "reject", comment: "同意，重拍后墨色均匀" },
+  });
+  check("中间格式记录内容真实变化 → 409", interimChanged.status === 409);
+
+  // 含孤立代理码元的中间格式记录：旧摘要有碰撞缺陷，必须拒绝其换序/碰撞请求
+  const surrShuffled = await api(`/api/samples/${sidRL}/review`, {
+    method: "POST", role: "reviewer", name: "复核员壬", idem: "restart-interim-surr",
+    raw: JSON.stringify({ comment: "边缘发虚\uD800", decision: "reject" }), // 同内容换序
+  });
+  check("含孤立代理的旧记录换序 → 409（不走旧摘要通道）", surrShuffled.status === 409);
+  const surrOther = await api(`/api/samples/${sidRL}/review`, {
+    method: "POST", role: "reviewer", name: "复核员壬", idem: "restart-interim-surr",
+    raw: JSON.stringify({ decision: "reject", comment: "边缘发虚\uD801" }), // 不同代理码元：旧摘要会碰撞
+  });
+  check("不同孤立代理码元借旧摘要碰撞 → 409（拒绝）", surrOther.status === 409);
+  // 该记录原始 JSON 指纹通道不受代理影响：原样请求仍可精确回放
+  const surrExact = await api(`/api/samples/${sidRL}/review`, {
+    method: "POST", role: "reviewer", name: "复核员壬", idem: "restart-interim-surr", raw: interimSurrogateRaw,
+  });
+  check("含代理旧记录原样请求仍经原始 JSON 通道精确识别", surrExact.status === 200
+    && surrExact.json.interimSurrStub === true);
 
   // 重启后：孤立代理码元差异仍可区分、原样（含字段换序）仍可重放
   const surrAfterDifferent = await api(`/api/samples/${sidSurr}/photos:batch`, {
