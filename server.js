@@ -1,214 +1,539 @@
 import http from "node:http";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, extname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const dbPath = join(__dirname, "data", "ink-stick-testing.json");
-const port = Number(process.env.PORT || 3037);
-const seed = {
-  "items": [
-    {
-      "code": "IS-001",
-      "smokeSource": "黄山松烟",
-      "glueRatio": "7.5%",
-      "ageYears": 8,
-      "storage": "恒湿柜B",
-      "status": "已试磨",
-      "logs": [
-        {
-          "at": "2026-06-11",
-          "step": "试磨",
-          "note": "宣纸20滴水，出墨快，评分86",
-          "score": 86
-        }
-      ]
-    },
-    {
-      "code": "IS-002",
-      "smokeSource": "桐油烟",
-      "glueRatio": "8%",
-      "ageYears": 3,
-      "storage": "试样盒C",
-      "status": "待试磨",
-      "logs": []
-    }
-  ]
-};
-const fields = [["code","墨锭编号","text"],["smokeSource","烟料来源","text"],["glueRatio","胶料比例","text"],["ageYears","存放年限","number"],["storage","存放位置","text"]];
-const stages = ["待试磨","已试磨","重点观察"];
-const statLabels = ["待试磨","已试磨","重点观察"];
-const extraFields = [["paper","试磨纸张"],["water","加水量"],["speed","出墨速度"],["colorLayer","墨色层次"],["sediment","沉淀情况"],["score","评分"]];
+import { Store, nowIso, newId, groupKeyOf } from "./lib/store.js";
+import { decode } from "./lib/png.js";
+import { analyzeImage, judge, hammingDistance } from "./lib/imaging.js";
 
-async function loadDb() {
-  if (!existsSync(dbPath)) {
-    await mkdir(dirname(dbPath), { recursive: true });
-    await writeFile(dbPath, JSON.stringify(seed, null, 2));
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const dataDir = process.env.DATA_DIR || join(__dirname, "data");
+const publicDir = join(__dirname, "public");
+const port = Number(process.env.PORT || 3037);
+const REQUIRED_VALID = 3;
+const MAX_BODY_BYTES = 24 * 1024 * 1024; // 24MB，够一批手机照片（前端先压缩）
+
+const store = new Store(dataDir);
+
+// ---------- 领域辅助 ----------
+
+function publicSample(sample) {
+  // 列表/详情接口不回传图片 base64，避免载荷过大
+  const versions = sample.versions.map(v => ({
+    ...v,
+    photos: v.photos.map(p => {
+      const { dataUrl, ...rest } = p;
+      void dataUrl;
+      return rest;
+    }),
+  }));
+  return { ...sample, versions };
+}
+
+function currentVersion(sample) {
+  return sample.versions[sample.versions.length - 1];
+}
+
+function findSample(db, idOrCode) {
+  return db.samples.find(s => s.id === idOrCode || s.code === idOrCode);
+}
+
+// 查重哈希：历史冻结版本的全部图片（驳回后不得复用旧图）+ 当前版本仅有效图
+// （当前版本里因缺标定/模糊而无效的图，修正后允许重新提交同一张）
+function dedupeHashes(sample, current) {
+  const hashes = [];
+  for (const v of sample.versions) {
+    for (const p of v.photos) {
+      if (!p.hash) continue;
+      if (v === current) { if (p.valid) hashes.push(BigInt("0x" + p.hash)); }
+      else hashes.push(BigInt("0x" + p.hash));
+    }
   }
-  return JSON.parse(await readFile(dbPath, "utf8"));
+  return hashes;
 }
-async function saveDb(db) { await writeFile(dbPath, JSON.stringify(db, null, 2)); }
-async function body(req) {
+
+function buildConclusion(version) {
+  const byId = new Map(version.photos.map(p => [p.id, p]));
+  const groups = version.groups
+    .map(g => ({ g, photos: g.photoIds.map(id => byId.get(id)).filter(Boolean) }))
+    .map(({ g, photos }) => ({ g, photos, validPhotos: photos.filter(p => p.valid) }))
+    .filter(x => x.validPhotos.length > 0)
+    .sort((a, b) => b.validPhotos.length - a.validPhotos.length);
+  const target = groups[0];
+  if (!target || target.validPhotos.length < REQUIRED_VALID) return null;
+  const valid = target.validPhotos;
+  const avg = key => valid.reduce((s, p) => s + (p.metrics[key] || 0), 0) / valid.length;
+  const toneSum = new Array(valid[0].metrics.tones.length).fill(0);
+  for (const p of valid) p.metrics.tones.forEach((t, i) => { toneSum[i] += t; });
+  const toneAvg = toneSum.map(v => v / valid.length);
+  // 扩散均匀度：各图面积的变异系数（越小越稳定）
+  const areas = valid.map(p => p.metrics.areaMm2);
+  const areaMean = areas.reduce((a, b) => a + b, 0) / areas.length;
+  const cv = areaMean === 0 ? 0
+    : Math.sqrt(areas.reduce((s, a) => s + (a - areaMean) ** 2, 0) / areas.length) / areaMean;
+  return {
+    at: nowIso(),
+    groupKey: target.g.key,
+    paper: target.g.paper,
+    lighting: target.g.lighting,
+    water: target.g.water,
+    validPhotoCount: valid.length,
+    photoIds: valid.map(p => p.id),
+    areaMm2Mean: round3(areaMean),
+    areaMm2Cv: round3(cv),
+    sharpnessMean: round3(avg("sharpness")),
+    blurScoreMean: round3(avg("blurScore")),
+    compactnessMean: round3(avg("compactness")),
+    inkMeanLevel: round3(avg("inkMeanLevel")),
+    toneDistribution: toneAvg.map(v => Math.round(v * 100000) / 100000),
+  };
+}
+
+function audit(db, actor, action, detail) {
+  db.audit.push({ id: newId("A"), at: nowIso(), actor: actor || "匿名", action, detail: detail || {} });
+}
+
+// ---------- 采集批处理：单张失败隔离，不影响同批其余照片 ----------
+
+function processPhoto(version, sample, entry, actor) {
+  const photoId = newId("P");
+  const base = {
+    id: photoId,
+    at: nowIso(),
+    uploadedBy: actor,
+    clientName: String(entry.clientName || "").slice(0, 120),
+    paper: strField(entry.paper),
+    lighting: strField(entry.lighting),
+    water: strField(entry.water),
+  };
+
+  // 1) 分组字段必须齐全（无法归组即无效）
+  if (!base.paper || !base.lighting || !base.water) {
+    return invalid(base, null, "missing_group", "缺少纸张/光照/水滴量，无法归组");
+  }
+  const key = groupKeyOf(entry);
+
+  // 2) 解码：单张损坏不影响批次其余照片
+  let image;
+  try {
+    const dataUrl = String(entry.dataUrl || "");
+    const m = /^data:image\/png;base64,([A-Za-z0-9+/=\s]+)$/.exec(dataUrl);
+    if (!m) throw new Error("not_png_dataurl");
+    image = decode(Buffer.from(m[1].replace(/\s/g, ""), "base64"));
+  } catch (err) {
+    return invalid(base, null, "decode_failed", "图片解码失败：" + describeDecodeError(err.message));
+  }
+  base.width = image.width;
+  base.height = image.height;
+
+  // 3) 标定
+  const pxPerMm = Number(entry.pxPerMm);
+  const calibrated = Number.isFinite(pxPerMm) && pxPerMm > 0;
+  if (calibrated) {
+    base.scale = {
+      pxPerMm: round3(pxPerMm),
+      markerPx: Number(entry.markerPx) || null,
+      knownMm: Number(entry.knownMm) || null,
+    };
+  }
+
+  // 4) 本地（服务端）提取墨迹与计量
+  let metrics;
+  try {
+    metrics = analyzeImage(image, calibrated ? { pxPerMm } : null);
+  } catch (err) {
+    return invalid(base, null, "analyze_failed", "指标计算失败：" + err.message);
+  }
+  base.hash = metrics.hash;
+  base.metrics = metrics;
+
+  // 5) 有效性判定（无墨迹优先于标定；重复跨所有历史版本）
+  const verdict = judge(metrics, {
+    calibrated,
+    existingHashes: dedupeHashes(sample, version),
+  });
+  base.valid = verdict.valid;
+  base.invalidReason = verdict.reason;
+  base.invalidReasonText = verdict.reasonText;
+
+  // 6) 归组（无效图也留在对应组里，便于复核说明原因）
+  let group = version.groups.find(g => g.key === key);
+  if (!group) {
+    group = { key, paper: base.paper, lighting: base.lighting, water: base.water, photoIds: [] };
+    version.groups.push(group);
+  }
+  group.photoIds.push(photoId);
+
+  return base;
+}
+
+function invalid(base, metrics, reason, text) {
+  return { ...base, valid: false, invalidReason: reason, invalidReasonText: text, metrics, hash: base.hash || null };
+}
+
+function describeDecodeError(msg) {
+  const map = {
+    not_png: "不是 PNG 图像",
+    not_png_dataurl: "图片格式应为 image/png（请在浏览器内重编码后上传）",
+    png_truncated: "文件已损坏或不完整",
+    png_bad_stream: "压缩数据损坏",
+    png_bad_filter: "压缩数据损坏",
+    png_interlace_unsupported: "暂不支持隔行扫描 PNG",
+    png_bitdepth_unsupported: "暂不支持非 8bit PNG",
+    png_colortype_unsupported: "不支持的色彩类型",
+    png_palette_missing: "调色板缺失",
+    png_too_large: "图像尺寸超过 4000px",
+  };
+  return map[msg] || msg;
+}
+
+function strField(v) {
+  if (typeof v !== "string") return "";
+  const s = v.trim();
+  return s.length > 60 ? "" : s;
+}
+
+function round3(v) { return Math.round(v * 1000) / 1000; }
+
+// ---------- HTTP ----------
+
+async function readBody(req) {
+  let size = 0;
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  return chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > MAX_BODY_BYTES) {
+      const err = new Error("payload_too_large");
+      err.status = 413;
+      throw err;
+    }
+    chunks.push(chunk);
+  }
+  if (!chunks.length) return {};
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    const err = new Error("bad_json");
+    err.status = 400;
+    throw err;
+  }
 }
+
 function send(res, status, data) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
-  res.end(JSON.stringify(data, null, 2));
+  res.end(JSON.stringify(data));
 }
-function html(res, text) {
-  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-  res.end(text);
+function sendError(res, status, error, extra) {
+  send(res, status, { error, ...(extra || {}) });
 }
-function newId() { return "IS-" + Date.now(); }
-function computeStats(items) {
-  const stats = Object.fromEntries(statLabels.map(label => [label, 0]));
-  for (const item of items) {
-    if (stats[item.status] !== undefined) stats[item.status] += 1;
-  }
-  return stats;
+
+function identity(req) {
+  let name = "";
+  try { name = decodeURIComponent(String(req.headers["x-operator-name"] || "")); } catch { name = String(req.headers["x-operator-name"] || ""); }
+  name = name.trim().slice(0, 40);
+  let role = String(req.headers["x-role"] || "").trim();
+  if (role !== "operator" && role !== "reviewer") role = "";
+  return { name, role };
 }
-function summarize(item) {
-  const logCount = (item.logs || []).length + (item.tasks || []).reduce((n, t) => n + (t.logs || []).length, 0);
-  return { ...item, logCount };
-}
-function page() {
-  return `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>墨锭试磨室</title>
-  <style>
-    :root { --bg:#f1f3ef; --panel:#fff; --ink:#20241f; --muted:#687066; --line:#d4ddd0; --accent:#526f43; --warn:#9b4937; }
-    * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--ink); font-family:Arial,"PingFang SC",sans-serif; }
-    header { padding:22px 28px; background:#fff; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:16px; align-items:center; }
-    h1 { margin:0; font-size:26px; } h2 { margin:0 0 12px; font-size:18px; } main { display:grid; grid-template-columns:380px 1fr; gap:22px; padding:22px 28px; }
-    form,.panel,.card,.stat { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
-    label { display:block; margin:10px 0 5px; color:var(--muted); font-size:13px; } input,select,textarea { width:100%; border:1px solid var(--line); border-radius:6px; padding:9px; font:inherit; background:#fff; } textarea { min-height:68px; }
-    button { border:0; border-radius:6px; background:var(--accent); color:#fff; padding:10px 13px; font-weight:700; cursor:pointer; } button.secondary { background:#69736a; }
-    .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-bottom:14px; } .stat strong { display:block; font-size:24px; }
-    .toolbar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; } .toolbar select,.toolbar input { width:auto; min-width:160px; }
-    .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; } .card { display:grid; gap:8px; }
-    .meta { color:var(--muted); font-size:13px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; }
-    .logs { border-top:1px solid var(--line); padding-top:8px; max-height:90px; overflow:auto; } .warn { color:var(--warn); font-weight:700; }
-    @media (max-width:900px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} }
-  </style>
-</head>
-<body>
-  <header><div><h1>墨锭试磨室</h1><div class="meta">墨锭建档、试磨记录和评分统计</div></div><button id="reload">刷新</button></header>
-  <main>
-    <section>
-      <form id="createForm"><h2>新增墨锭</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存墨锭</button></form>
-      <form id="actionForm" style="margin-top:14px"><h2>创建试磨记录</h2><label>选择墨锭</label><select name="id" id="itemSelect"></select><div id="extraFields"></div><button>提交记录</button></form>
-    </section>
-    <section>
-      <div class="stats" id="stats"></div>
-      <div class="toolbar"><select id="statusFilter"><option value="">全部状态</option>${stages.map(s => '<option>'+s+'</option>').join('')}</select><input id="search" placeholder="搜索编号或关键词"></div>
-      <div class="panel"><h2>选择墨锭后录入试磨记录，系统会保留多次试磨结果并更新评分状态。</h2><div class="grid" id="cards"></div></div>
-    </section>
-  </main>
-  <script>
-    const fields = [["code","墨锭编号","text"],["smokeSource","烟料来源","text"],["glueRatio","胶料比例","text"],["ageYears","存放年限","number"],["storage","存放位置","text"]];
-    const stages = ["待试磨","已试磨","重点观察"];
-    const extraFields = [["paper","试磨纸张"],["water","加水量"],["speed","出墨速度"],["colorLayer","墨色层次"],["sediment","沉淀情况"],["score","评分"]];
-    const createForm = document.querySelector('#createForm');
-    const actionForm = document.querySelector('#actionForm');
-    const cards = document.querySelector('#cards');
-    const statsEl = document.querySelector('#stats');
-    const itemSelect = document.querySelector('#itemSelect');
-    let items = [];
-    async function api(path, options) {
-      const res = await fetch(path, options && options.body ? { ...options, headers:{ 'Content-Type':'application/json' } } : options);
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || '请求失败');
-      return data;
-    }
-    function renderForms() {
-      document.querySelector('#fields').innerHTML = fields.map(([key,label,type]) => '<label>'+label+'</label><input name="'+key+'" type="'+type+'" '+(key==='code'?'required':'')+'>').join('');
-      document.querySelector('#extraFields').innerHTML = extraFields.map(([key,label]) => '<label>'+label+'</label><input name="'+key+'">').join('');
-    }
-    function render() {
-      itemSelect.innerHTML = items.map(item => '<option value="'+(item.id || item.code)+'">'+(item.code || item.id)+' · '+(item.name || item.shipType || item.source || item.plateSize || '')+'</option>').join('');
-      const stats = Object.fromEntries(stages.map(s => [s, items.filter(i => i.status === s).length]));
-      statsEl.innerHTML = Object.entries(stats).map(([k,v]) => '<div class="stat"><span>'+k+'</span><strong>'+v+'</strong></div>').join('');
-      const status = document.querySelector('#statusFilter').value;
-      const q = document.querySelector('#search').value.trim();
-      const visible = items.filter(item => (!status || item.status === status) && (!q || JSON.stringify(item).includes(q)));
-      cards.innerHTML = visible.map(item => cardHtml(item)).join('');
-      document.querySelectorAll('[data-status]').forEach(sel => sel.onchange = async () => { await api('/api/items/'+sel.dataset.status, { method:'PATCH', body: JSON.stringify({ status: sel.value }) }); await load(); });
-      document.querySelectorAll('[data-note]').forEach(btn => btn.onclick = async () => { const id = btn.dataset.note; const note = prompt('记录备注'); if (note) { await api('/api/items/'+id+'/logs', { method:'POST', body: JSON.stringify({ step:'备注', note }) }); await load(); } });
-    }
-    function cardHtml(item) {
-      const main = fields.slice(0,4).map(([key,label]) => '<div><b>'+label+'</b> '+(item[key] ?? '')+'</div>').join('');
-      const tasks = (item.tasks || []).map(t => '<div class="meta">任务 '+t.position+' · '+t.status+' · '+t.tension+'</div>').join('');
-      const logs = (item.logs || []).slice(-4).map(l => '<div>'+l.step+'：'+l.note+'</div>').join('');
-      return '<article class="card"><h3>'+(item.code || item.id)+'</h3><span class="pill">'+item.status+'</span>'+main+tasks+'<label>状态</label><select data-status="'+(item.id || item.code)+'">'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select><button class="secondary" data-note="'+(item.id || item.code)+'">追加备注</button><div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
-    }
-    async function load() { items = await api('/api/items'); render(); }
-    createForm.onsubmit = async event => { event.preventDefault(); await api('/api/items', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(createForm).entries())) }); createForm.reset(); await load(); };
-    actionForm.onsubmit = async event => { event.preventDefault(); await api('/api/items/'+itemSelect.value+'/action', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(actionForm).entries())) }); actionForm.reset(); await load(); };
-    document.querySelector('#statusFilter').onchange = render; document.querySelector('#search').oninput = render; document.querySelector('#reload').onclick = load;
-    renderForms(); load();
-  </script>
-</body>
-</html>`;
-}
+
+const MIME = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css" };
 
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
-    const db = await loadDb();
-    if (req.method === "GET" && url.pathname === "/") return html(res, page());
-    if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.map(summarize));
-    if (req.method === "POST" && url.pathname === "/api/items") {
-      const input = await body(req);
-      const item = { id: newId(), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建墨锭" }] };
-      
-      db.items.unshift(item);
-      await saveDb(db);
-      return send(res, 201, item);
+    const p = url.pathname;
+
+    // 静态资源
+    if (req.method === "GET" && (p === "/" || p === "/index.html")) {
+      return serveFile(res, join(publicDir, "index.html"));
     }
-    const patch = url.pathname.match(/^\/api\/items\/([^/]+)$/);
-    if (patch && req.method === "PATCH") {
-      const item = db.items.find(x => x.id === patch[1] || x.code === patch[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
-      Object.assign(item, await body(req));
-      item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: "状态", note: "更新为" + item.status });
-      await saveDb(db);
-      return send(res, 200, item);
+    const staticMatch = /^\/(lib\/[a-z-]+\.js|app\.js|styles\.css)$/.exec(p);
+    if (req.method === "GET" && staticMatch) {
+      const path = staticMatch[1] === "app.js" || staticMatch[1] === "styles.css"
+        ? join(publicDir, staticMatch[1])
+        : join(__dirname, staticMatch[1]);
+      return serveFile(res, path);
     }
-    const log = url.pathname.match(/^\/api\/items\/([^/]+)\/logs$/);
-    if (log && req.method === "POST") {
-      const item = db.items.find(x => x.id === log[1] || x.code === log[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
-      const input = await body(req);
-      item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: input.step || "记录", note: input.note || "" });
-      await saveDb(db);
-      return send(res, 201, item);
+
+    // 故障注入（仅允许显式开启的测试环境）
+    if (req.method === "POST" && p === "/api/testing/fail-next-write") {
+      if (process.env.ALLOW_FAULTS !== "1") return sendError(res, 403, "fault_injection_disabled");
+      store.failNextWrite = true;
+      return send(res, 200, { ok: true });
     }
-    const action = url.pathname.match(/^\/api\/items\/([^/]+)\/action$/);
-    if (action && req.method === "POST") {
-      const item = db.items.find(x => x.id === action[1] || x.code === action[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
-      const input = await body(req);
-      item.logs ||= [];
-      const score = Number(input.score || 0);
-      item.tests ||= [];
-      item.tests.push({ at: new Date().toISOString(), ...input, score });
-      item.status = score >= 85 ? "已试磨" : "重点观察";
-      item.logs.push({ at: new Date().toISOString(), step: "试磨", note: (input.paper || "试纸") + "，评分" + score, score });
-      await saveDb(db);
-      return send(res, 201, item);
+
+    // GET 接口
+    if (req.method === "GET" && p === "/api/state") {
+      return send(res, 200, {
+        dbVersion: store.db.dbVersion,
+        samples: store.db.samples.map(publicSample),
+      });
     }
-    if (req.method === "GET" && url.pathname === "/api/stats") return send(res, 200, computeStats(db.items));
-    send(res, 404, { error: "not_found" });
+    if (req.method === "GET" && p === "/api/audit") {
+      return send(res, 200, { audit: store.db.audit.slice(-300).reverse() });
+    }
+    const photoGet = /^\/api\/samples\/([^/]+)\/photos\/([^/]+)$/.exec(p);
+    if (req.method === "GET" && photoGet) {
+      const sample = findSample(store.db, decodeURIComponent(photoGet[1]));
+      if (!sample) return sendError(res, 404, "sample_not_found");
+      for (const v of sample.versions) {
+        const ph = v.photos.find(x => x.id === photoGet[2]);
+        if (ph) {
+          res.writeHead(200, {
+            "Content-Type": "image/png",
+            "Cache-Control": "no-store",
+            "X-Photo-Version": String(v.version),
+          });
+          const b64 = String(ph.dataUrl).split(",")[1] || "";
+          return res.end(Buffer.from(b64, "base64"));
+        }
+      }
+      return sendError(res, 404, "photo_not_found");
+    }
+
+    // 以下均为写操作：必须自报身份与角色
+    const who = identity(req);
+    if (req.method !== "GET") {
+      if (!who.name) return sendError(res, 401, "identity_required");
+      if (!who.role) return sendError(res, 401, "role_required");
+    }
+
+    // 新建留样（操作员）
+    if (req.method === "POST" && p === "/api/samples") {
+      if (who.role !== "operator") return sendError(res, 403, "reviewer_cannot_collect");
+      const input = await readBody(req);
+      const result = await idempotent(req, input, "create_sample", db => {
+        const code = strField(input.code);
+        if (!code) throw httpError(400, "code_required");
+        if (db.samples.some(s => s.code === code)) throw httpError(409, "sample_code_exists");
+        const now = nowIso();
+        const sample = {
+          id: newId("S"),
+          code,
+          name: strField(input.name) || code + " 留样",
+          smokeSource: strField(input.smokeSource),
+          glueRatio: strField(input.glueRatio),
+          ageYears: Number.isFinite(Number(input.ageYears)) ? Number(input.ageYears) : null,
+          storage: strField(input.storage),
+          createdAt: now,
+          versions: [{
+            version: 1,
+            status: "collecting",
+            createdAt: now,
+            createdBy: who.name,
+            submittedBy: who.name,
+            groups: [],
+            photos: [],
+            conclusion: null,
+            review: null,
+            snapshot: null,
+          }],
+        };
+        db.samples.unshift(sample);
+        audit(db, who.name, "sample_create", { sampleId: sample.id, code });
+        return { status: 201, body: publicSample(sample) };
+      });
+      return send(res, result.status, result.body);
+    }
+
+    // 批量采集（操作员）
+    const uploadMatch = /^\/api\/samples\/([^/]+)\/photos:batch$/.exec(p);
+    if (req.method === "POST" && uploadMatch) {
+      if (who.role !== "operator") return sendError(res, 403, "reviewer_cannot_collect");
+      const input = await readBody(req);
+      const result = await idempotent(req, input, "batch_upload", db => {
+        const sample = findSample(db, decodeURIComponent(uploadMatch[1]));
+        if (!sample) throw httpError(404, "sample_not_found");
+        const version = currentVersion(sample);
+        if (version.status === "approved") throw httpError(409, "version_approved_open_new", { hint: "当前版本已批准，如需补充请申请新版本" });
+        if (version.status === "pending_review") throw httpError(409, "version_locked_for_review", { hint: "版本已提交复核并锁定，驳回后会生成新版本" });
+        if (version.status === "rejected") throw httpError(409, "superseded_version");
+
+        const entries = Array.isArray(input.photos) ? input.photos : [];
+        if (!entries.length) throw httpError(400, "empty_batch");
+
+        const results = [];
+        let validCount = 0;
+        for (const entry of entries) {
+          try {
+            const rawDataUrl = String((entry || {}).dataUrl || "");
+            const photo = processPhoto(version, sample, entry || {}, who.name);
+            // 只有成功解码的图片保存二进制；损坏文件不落盘
+            if (photo.invalidReason !== "decode_failed"
+              && photo.invalidReason !== "analyze_failed"
+              && photo.invalidReason !== "missing_group") {
+              photo.dataUrl = rawDataUrl;
+            }
+            version.photos.push(photo);
+            if (photo.valid) validCount++;
+            results.push({ clientName: photo.clientName, photoId: photo.id, valid: photo.valid,
+              invalidReason: photo.invalidReason, invalidReasonText: photo.invalidReasonText,
+              groupKey: groupKeyOf(photo), metrics: summarizeMetrics(photo.metrics) });
+          } catch (err) {
+            // 兜底：任何一张图的意外失败都不得拖垮同批其余照片
+            results.push({ clientName: String(entry?.clientName || ""), valid: false,
+              invalidReason: "unexpected", invalidReasonText: "处理异常：" + err.message });
+          }
+        }
+
+        // 达到 3 张有效图：生成结论快照并锁定版本
+        const totalValid = version.photos.filter(x => x.valid).length;
+        if (totalValid >= REQUIRED_VALID) {
+          const conclusion = buildConclusion(version);
+          if (conclusion) {
+            version.status = "pending_review";
+            version.conclusion = conclusion;
+            version.snapshot = {
+              frozenAt: nowIso(),
+              photoCount: version.photos.length,
+              validCount: totalValid,
+              groups: version.groups.map(g => ({ ...g })),
+            };
+          }
+        }
+        audit(db, who.name, "batch_upload", {
+          sampleId: sample.id, version: version.version,
+          received: entries.length, accepted: validCount,
+          status: version.status,
+        });
+        return {
+          status: 201,
+          body: {
+            sampleId: sample.id, version: version.version,
+            versionStatus: version.status,
+            validCount: totalValid,
+            requiredValid: REQUIRED_VALID,
+            conclusion: version.conclusion,
+            results,
+          },
+        };
+      });
+      return send(res, result.status, result.body);
+    }
+
+    // 复核（复核人）：批准 / 驳回
+    const reviewMatch = /^\/api\/samples\/([^/]+)\/review$/.exec(p);
+    if (req.method === "POST" && reviewMatch) {
+      if (who.role !== "reviewer") return sendError(res, 403, "only_reviewer_can_review");
+      const input = await readBody(req);
+      const result = await idempotent(req, input, "review", db => {
+        const sample = findSample(db, decodeURIComponent(reviewMatch[1]));
+        if (!sample) throw httpError(404, "sample_not_found");
+        const version = currentVersion(sample);
+        if (version.status !== "pending_review") throw httpError(409, "version_not_pending", { status: version.status });
+
+        const decision = input.decision === "approve" ? "approve" : input.decision === "reject" ? "reject" : null;
+        if (!decision) throw httpError(400, "decision_required");
+        const comment = String(input.comment || "").trim().slice(0, 500);
+        if (decision === "reject" && !comment) throw httpError(400, "reject_requires_comment");
+
+        const review = { decision, at: nowIso(), by: who.name, comment };
+        if (decision === "approve") {
+          version.status = "approved";
+          version.review = review;
+          audit(db, who.name, "review_approve", { sampleId: sample.id, version: version.version });
+        } else {
+          // 驳回：旧版本完整冻结（图、尺度、结论快照均不变），另起新版本供重采
+          version.status = "rejected";
+          version.review = review;
+          const now = nowIso();
+          sample.versions.push({
+            version: version.version + 1,
+            status: "collecting",
+            createdAt: now,
+            createdBy: who.name,
+            basedOnRejectedVersion: version.version,
+            rejectComment: comment,
+            submittedBy: null,
+            groups: [],
+            photos: [],
+            conclusion: null,
+            review: null,
+            snapshot: null,
+          });
+          audit(db, who.name, "review_reject", {
+            sampleId: sample.id, version: version.version,
+            newVersion: version.version + 1, comment,
+          });
+        }
+        return { status: 200, body: { sample: publicSample(sample) } };
+      });
+      return send(res, result.status, result.body);
+    }
+
+    return sendError(res, 404, "not_found");
   } catch (error) {
-    send(res, 500, { error: error.message });
+    if (error.status) return sendError(res, error.status, error.message, error.extra);
+    console.error(error);
+    sendError(res, 500, "internal_error");
   }
 });
-server.listen(port, () => console.log("墨锭试磨室 listening on http://localhost:" + port));
+
+function httpError(status, message, extra) {
+  const err = new Error(message);
+  err.status = status;
+  err.extra = extra;
+  return err;
+}
+
+function summarizeMetrics(m) {
+  if (!m) return null;
+  return {
+    inkPixelCount: m.inkPixelCount, inkRatio: m.inkRatio,
+    areaMm2: m.areaMm2 ?? null, blurScore: m.blurScore,
+    sharpness: m.sharpness, compactness: m.compactness,
+    inkMeanLevel: m.inkMeanLevel, tones: m.tones,
+  };
+}
+
+// 幂等键 + 写互斥：重复提交/并发请求整体只成功一次。
+// 首次成功的响应被缓存；键相同但载荷不同视为冲突。
+function idempotent(req, input, scope, fn) {
+  const key = String(req.headers["idempotency-key"] || "").trim();
+  return store.mutate(async db => {
+    if (key) {
+      const rec = db.idempotency[key];
+      if (rec) {
+        if (rec.scope !== scope || rec.fingerprint !== fingerprint(input)) {
+          throw httpError(409, "idempotency_key_reused_with_different_payload");
+        }
+        return { status: rec.status, body: rec.body, replayed: true };
+      }
+    }
+    const result = await fn(db);
+    if (key) {
+      db.idempotency[key] = {
+        scope, fingerprint: fingerprint(input),
+        status: result.status, body: result.body, at: nowIso(),
+      };
+    }
+    return result;
+  });
+}
+
+function fingerprint(input) {
+  // 仅按业务载荷指纹，避免 header 差异导致重放失败
+  const { photos, ...rest } = input || {};
+  const slimPhotos = Array.isArray(photos)
+    ? photos.map(ph => ({
+        clientName: ph.clientName, paper: ph.paper, lighting: ph.lighting, water: ph.water,
+        pxPerMm: ph.pxPerMm, markerPx: ph.markerPx, knownMm: ph.knownMm,
+        len: String(ph.dataUrl || "").length,
+        head: String(ph.dataUrl || "").slice(0, 64),
+      }))
+    : photos;
+  return JSON.stringify({ ...rest, photos: slimPhotos });
+}
+
+async function serveFile(res, path) {
+  if (!existsSync(path)) {
+    res.writeHead(404); return res.end("not found");
+  }
+  res.writeHead(200, { "Content-Type": MIME[extname(path)] || "application/octet-stream" });
+  res.end(await readFile(path));
+}
+
+await store.init();
+server.listen(port, () => console.log("试墨图像计量与复核台 listening on http://localhost:" + port + " (data: " + dataDir + ")"));

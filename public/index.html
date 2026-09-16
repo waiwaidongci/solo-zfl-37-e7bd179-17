@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>试墨图像计量与复核台</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header>
+    <div class="title">
+      <h1>试墨图像计量与复核台</h1>
+      <div class="sub">试墨纸照片采集 · 本地计量 · 分组复核 · 版本留痕</div>
+    </div>
+    <div class="identity">
+      <label>姓名
+        <input id="opName" type="text" placeholder="输入工号或姓名" autocomplete="off">
+      </label>
+      <div class="roles" role="radiogroup" aria-label="当前角色">
+        <button type="button" class="role active" data-role="operator">操作员（采集）</button>
+        <button type="button" class="role" data-role="reviewer">复核人（复核）</button>
+      </div>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="collect">采集</button>
+    <button class="tab" data-tab="review">复核</button>
+    <button class="tab" data-tab="archive">档案</button>
+    <button class="tab" data-tab="audit">审计</button>
+  </nav>
+
+  <main>
+    <!-- 采集 -->
+    <section id="tab-collect" class="tabpanel active">
+      <div class="panel">
+        <h2>1. 选择留样</h2>
+        <div class="row">
+          <select id="sampleSelect"></select>
+          <button class="ghost" id="newSampleBtn" type="button">新建留样</button>
+          <button class="ghost" id="refreshBtn" type="button">刷新</button>
+        </div>
+        <div id="newSampleBox" class="hidden form-grid">
+          <input id="nsCode" placeholder="留样编号，如 IS-010">
+          <input id="nsName" placeholder="名称（可选）">
+          <input id="nsSource" placeholder="烟料来源">
+          <input id="nsGlue" placeholder="胶料比例">
+          <input id="nsAge" type="number" placeholder="存放年限">
+          <input id="nsStorage" placeholder="存放位置">
+          <button id="nsSubmit">建档</button>
+        </div>
+        <div id="versionHint" class="hint"></div>
+      </div>
+
+      <div class="panel">
+        <h2>2. 批量上传试墨纸照片</h2>
+        <div class="form-grid">
+          <input id="defPaper" placeholder="纸张（如 净皮宣纸）">
+          <input id="defLight" placeholder="光照（如 南向自然光）">
+          <input id="defWater" placeholder="水滴量（如 20滴）">
+          <input id="defKnownMm" type="number" placeholder="标尺已知长度 mm">
+          <button class="ghost" type="button" id="applyDefaults">套用到本批全部</button>
+        </div>
+        <div class="row wrap">
+          <input type="file" id="fileInput" accept="image/png,image/jpeg" multiple capture="environment">
+          <button type="button" id="submitBatch" class="primary">提交本批</button>
+          <button type="button" id="clearBatch" class="ghost">清空</button>
+        </div>
+        <div class="hint">先在每张缩略图上拖动两条标线对齐刻度，填入该标尺的已知毫米数；指标在本机即时预览，最终以服务端计量为准。模糊、重复或缺标定的图会被标记原因，但不影响同批其余照片。</div>
+        <div id="pendingList" class="cards"></div>
+      </div>
+
+      <div id="batchResult" class="panel hidden"></div>
+    </section>
+
+    <!-- 复核 -->
+    <section id="tab-review" class="tabpanel">
+      <div id="reviewRoleHint" class="panel hint hidden"></div>
+      <div id="reviewList" class="cards"></div>
+    </section>
+
+    <!-- 档案 -->
+    <section id="tab-archive" class="tabpanel">
+      <input id="archiveSearch" placeholder="搜索编号 / 名称 / 烟料">
+      <div id="archiveList" class="cards"></div>
+    </section>
+
+    <!-- 审计 -->
+    <section id="tab-audit" class="tabpanel">
+      <div class="panel"><h2>操作审计</h2><div id="auditList" class="audit"></div></div>
+    </section>
+  </main>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
