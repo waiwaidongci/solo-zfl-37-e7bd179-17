@@ -1,5 +1,4 @@
 import http from "node:http";
-import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join, extname } from "node:path";
@@ -8,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { Store, nowIso, newId, groupKeyOf } from "./lib/store.js";
 import { decode } from "./lib/png.js";
 import { analyzeImage, judge, hammingDistance } from "./lib/imaging.js";
+import { canonicalHash, legacyFingerprint } from "./lib/canonical.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dataDir = process.env.DATA_DIR || join(__dirname, "data");
@@ -526,7 +526,15 @@ async function idempotent(req, input, scope, who, fn) {
     if (key) {
       const rec = db.idempotency[key];
       if (rec) {
-        if (rec.scope !== scope || rec.fingerprint !== fingerprint(input) || rec.actor !== who.name) {
+        const fpCanonical = fingerprint(input);
+        const fpLegacy = legacyFingerprint(input);
+        // 命中条件：规范化指纹一致（字段换序也算重放），或旧指纹一致
+        // （原样重发，且兼容升级前已落库、只存旧指纹的记录）。
+        const samePayload = rec.fingerprint === fpCanonical
+          || rec.fingerprintCanonical === fpCanonical
+          || rec.fingerprint === fpLegacy
+          || rec.fingerprintLegacy === fpLegacy;
+        if (rec.scope !== scope || rec.actor !== who.name || !samePayload) {
           throw httpError(409, "idempotency_key_reused_with_different_payload");
         }
         return { status: rec.status, body: rec.body, replayed: true };
@@ -535,7 +543,11 @@ async function idempotent(req, input, scope, who, fn) {
     const result = await fn(db);
     if (key) {
       db.idempotency[key] = {
-        scope, fingerprint: fingerprint(input), actor: who.name,
+        scope,
+        fingerprint: fingerprint(input),
+        fingerprintCanonical: fingerprint(input),
+        fingerprintLegacy: legacyFingerprint(input),
+        actor: who.name,
         status: result.status, body: result.body, at: nowIso(),
       };
     }
@@ -544,9 +556,8 @@ async function idempotent(req, input, scope, who, fn) {
 }
 
 function fingerprint(input) {
-  // 对完整业务载荷做 SHA-256：图片哪怕只差一个字节也不会被当成同载荷重放。
-  // （请求头不纳入指纹，因此同键重试不受 header 影响。）
-  return createHash("sha256").update(JSON.stringify(input ?? null)).digest("hex");
+  // 规范化指纹：对象成员顺序无关，数组顺序与值类型保留，图片完整内容参与哈希。
+  return canonicalHash(input);
 }
 
 async function serveFile(res, path) {

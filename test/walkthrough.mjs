@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
 
 import { sharpSet, blurryPng, blankSheet, garbagePng, fourthPng, fifthPng, lookalikePair, dataUrl } from "./fixtures.mjs";
+import { canonicalHash, legacyFingerprint } from "../lib/canonical.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
@@ -30,13 +31,13 @@ function section(t) { console.log("\n=== " + t + " ==="); }
 
 async function api(path, opts = {}) {
   const headers = {};
-  if (opts.body) headers["Content-Type"] = "application/json";
+  if (opts.body || opts.raw !== undefined) headers["Content-Type"] = "application/json";
   if (opts.role) headers["X-Role"] = opts.role;
   if (opts.name) headers["X-Operator-Name"] = encodeURIComponent(opts.name);
   if (opts.idem) headers["Idempotency-Key"] = opts.idem;
+  const payload = opts.raw !== undefined ? opts.raw : (opts.body ? JSON.stringify(opts.body) : undefined);
   const res = await fetch((opts.base || BASE) + path, {
-    method: opts.method || "GET", headers,
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
+    method: opts.method || "GET", headers, body: payload,
   });
   let json = null;
   try { json = await res.json(); } catch {}
@@ -193,7 +194,76 @@ async function main() {
   check("同键同载荷仍正常重放（且不新增图片）",
     replaySame.status === 201 && st.samples.find(s => s.id === sidFp).versions[0].photos.length === 1);
 
-  section("3.2 反例：姓名↔角色稳定绑定，换角色被拒");
+  section("3.2 规范化指纹：忽略字段排列，保留数组顺序/值类型/图片内容");
+  // —— 纯函数级断言 ——
+  const payload1 = { x: null, note: "z", photos: [{ clientName: "a", water: "20滴", pxPerMm: 5, dataUrl: "IMG" }] };
+  const payloadShuffled = { photos: [{ dataUrl: "IMG", pxPerMm: 5, water: "20滴", clientName: "a" }], note: "z", x: null };
+  check("单元：对象成员换序（含嵌套）指纹一致", canonicalHash(payload1) === canonicalHash(payloadShuffled));
+  check("单元：数组换序指纹不同", canonicalHash({ photos: [1, 2] }) !== canonicalHash({ photos: [2, 1] }));
+  check("单元：值类型保留（数字≠字符串）", canonicalHash({ n: 5 }) !== canonicalHash({ n: "5" }));
+  check("单元：值类型保留（null≠对象、true≠1）",
+    canonicalHash({ n: null }) !== canonicalHash({ n: {} })
+    && canonicalHash({ n: true }) !== canonicalHash({ n: 1 }));
+  check("单元：图片内容一个字符变化指纹即变",
+    canonicalHash({ photos: [{ dataUrl: "IMG-A" }] }) !== canonicalHash({ photos: [{ dataUrl: "IMG-B" }] }));
+  check("单元：旧指纹确实对键序敏感（证明需要兼容双通道）",
+    legacyFingerprint(payload1) !== legacyFingerprint(payloadShuffled));
+
+  // —— HTTP 反例 1：字段书写顺序不同、业务内容相同 → 视为同载荷重放 ——
+  const cCanon = await api("/api/samples", {
+    method: "POST", role: "operator", name: "采集员丁", idem: "canon-create", body: { code: "IS-CANON" },
+  });
+  const sidCanon = cCanon.json.id;
+  const canonPhoto = {
+    clientName: "a.png", dataUrl: dataUrl(lookA), paper: "净皮宣纸",
+    lighting: "南向自然光", water: "20滴", pxPerMm: 5, markerPx: 50, knownMm: 10,
+  };
+  const canonRaw1 = JSON.stringify({ x: null, note: "整批备注", photos: [canonPhoto] });
+  const canonRaw2 = JSON.stringify({
+    photos: [{
+      knownMm: 10, markerPx: 50, pxPerMm: 5, water: "20滴",
+      lighting: "南向自然光", paper: "净皮宣纸", dataUrl: dataUrl(lookA), clientName: "a.png",
+    }],
+    note: "整批备注", x: null,
+  });
+  const canonFirst = await api(`/api/samples/${sidCanon}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "canon-key", raw: canonRaw1,
+  });
+  check("字段顺序 A 提交成功", canonFirst.status === 201 && canonFirst.json.validCount === 1);
+  const canonReplay = await api(`/api/samples/${sidCanon}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "canon-key", raw: canonRaw2,
+  });
+  check("反例1：仅调换字段书写顺序 → 仍识别为重放 201", canonReplay.status === 201);
+  check("重放不新增图片（仍为 1 张）", canonReplay.json.validCount === 1
+    && canonReplay.json.results.length === 1);
+
+  // —— HTTP 反例 2：数组换序（照片业务顺序变化）→ 必须 409 ——
+  const cArr = await api("/api/samples", {
+    method: "POST", role: "operator", name: "采集员丁", idem: "arr-create", body: { code: "IS-ARR" },
+  });
+  const sidArr = cArr.json.id;
+  const pe2 = entry(p2, { clientName: "e2.png" });
+  const pe3 = entry(p3, { clientName: "e3.png" });
+  const arrFirst = await api(`/api/samples/${sidArr}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "arr-key", body: { photos: [pe2, pe3] },
+  });
+  check("数组顺序 [e2,e3] 提交成功（2 张有效）", arrFirst.status === 201 && arrFirst.json.validCount === 2);
+  const arrSwap = await api(`/api/samples/${sidArr}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "arr-key", body: { photos: [pe3, pe2] },
+  });
+  check("反例2：照片数组换序 [e3,e2] → 409", arrSwap.status === 409
+    && arrSwap.json.error.includes("idempotency"));
+  // 业务值变化（水滴量 20滴 → 21滴）即使字段顺序打乱也必须 409
+  const valueChanged = await api(`/api/samples/${sidArr}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "arr-key",
+    raw: JSON.stringify({ photos: [{ knownMm: 10, markerPx: 50, pxPerMm: 5, water: "21滴", lighting: pe2.lighting, paper: pe2.paper, dataUrl: pe2.dataUrl, clientName: "e2.png" }, pe3] }),
+  });
+  check("业务值变化（20滴→21滴）→ 409", valueChanged.status === 409);
+
+  // —— HTTP 反例 3 已在 3.1 覆盖：等长同前缀图片仅尾部不同 → 409 ——
+  check("反例3：图片字节真实变化 → 409（见 3.1 lookalike 用例）", secondLook.status === 409);
+
+  section("3.3 反例：姓名↔角色稳定绑定，换角色被拒");
   // 新姓名先用复核人身份
   const revFirst = await api(`/api/samples/${sid}/review`, {
     method: "POST", role: "reviewer", name: "临时工戊",
@@ -415,8 +485,45 @@ async function main() {
 
   // 优雅停服，再冷启动
   section("9. 重启：数据持久化，历史仍可查看");
+  // 重启前：为规范化重放与「旧指纹记录」各准备一个留样
+  const cR = await api("/api/samples", {
+    method: "POST", role: "operator", name: "采集员丁", idem: "restart-canon-create", body: { code: "IS-RC" },
+  });
+  const sidRC = cR.json.id;
+  const rcPhoto = entry(p2, { clientName: "rc.png" });
+  const rcRaw1 = JSON.stringify({ note: "重启用", photos: [rcPhoto] });
+  const rcRaw2 = JSON.stringify({ photos: [Object.fromEntries(Object.entries(rcPhoto).reverse())], note: "重启用" });
+  check("重启前规范化批次提交成功", (await api(`/api/samples/${sidRC}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "restart-canon-key", raw: rcRaw1,
+  })).status === 201);
+
+  const cL = await api("/api/samples", {
+    method: "POST", role: "operator", name: "采集员丁", idem: "restart-legacy-create", body: { code: "IS-RL" },
+  });
+  const sidRL = cL.json.id;
+  const legacyPayload = { photos: [entry(p3, { clientName: "rl.png" })] };
+  const legacyRaw = JSON.stringify(legacyPayload);
+
   st = (await api("/api/state")).json;
   await stop(srv.child);
+
+  // 停机注入一条「升级前格式」的幂等记录：只有旧指纹 fingerprint，没有规范化字段
+  const diskDb = JSON.parse(await readFile(join(dataDir, "ink-station.json"), "utf8"));
+  diskDb.idempotency["restart-legacy-key"] = {
+    scope: "batch_upload",
+    fingerprint: legacyFingerprint(legacyPayload),
+    actor: "采集员丁",
+    status: 201,
+    body: {
+      sampleId: sidRL, version: 1, versionStatus: "collecting",
+      validCount: 1, requiredValid: 3, conclusion: null,
+      results: [{ clientName: "rl.png", photoId: "P-LEGACYSTUB", valid: true, invalidReason: null, invalidReasonText: "", groupKey: "", metrics: null }],
+      legacyStub: true,
+    },
+    at: "2026-09-16T00:00:00.000Z",
+  };
+  await writeFile(join(dataDir, "ink-station.json"), JSON.stringify(diskDb));
+
   srv = await startServer(dataDir, { faults: true });
   const st2 = (await api("/api/state")).json;
   check("重启后留样数量一致", st2.samples.length === st.samples.length, `${st2.samples.length} != ${st.samples.length}`);
@@ -436,6 +543,32 @@ async function main() {
   });
   check("重启后姓名↔角色绑定仍生效（采集员甲不能变复核人）",
     bindingAfterRestart.status === 403 && bindingAfterRestart.json.error === "identity_role_bound");
+
+  // 重启后：新格式记录字段换序仍可重放
+  const rcReplay = await api(`/api/samples/${sidRC}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "restart-canon-key", raw: rcRaw2,
+  });
+  check("重启后字段换序的同键重放仍命中（201 且不新增）",
+    rcReplay.status === 201 && rcReplay.json.validCount === 1 && !rcReplay.json.legacyStub);
+  const rcState = (await api("/api/state")).json.samples.find(s => s.id === sidRC);
+  check("重启后重放未重复落库（仍 1 张图）", rcState.versions[0].photos.length === 1);
+
+  // 重启后：只含旧指纹的历史幂等记录——原样请求可识别
+  const legacyExact = await api(`/api/samples/${sidRL}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "restart-legacy-key", raw: legacyRaw,
+  });
+  check("重启后旧幂等记录原样请求仍可识别（201 回放）",
+    legacyExact.status === 201 && legacyExact.json.legacyStub === true);
+  // 旧记录换字段顺序：旧指纹不匹配、规范化指纹也没有 → 409
+  const legacyShuffledRaw = JSON.stringify({
+    photos: [Object.fromEntries(Object.entries(legacyPayload.photos[0]).reverse())],
+  });
+  const legacyShuffled = await api(`/api/samples/${sidRL}/photos:batch`, {
+    method: "POST", role: "operator", name: "采集员丁", idem: "restart-legacy-key", raw: legacyShuffledRaw,
+  });
+  check("旧格式记录换字段顺序 → 409（旧记录维持严格识别）", legacyShuffled.status === 409);
+  const rlState = (await api("/api/state")).json.samples.find(s => s.id === sidRL);
+  check("旧记录回放没有真正写入图片", rlState.versions[0].photos.length === 0);
 
   await stop(srv.child);
   console.log(`\n走查结果：${passed} 通过，${failed} 失败`);
